@@ -1,0 +1,17 @@
+package:
+    name: zuspec-rt-eng
+    version: 0.0.1
+
+    dep-sets:
+    - name: default-dev
+      uses: default
+      deps:
+      - name: pytest
+        src: pypi
+      - name: zuspec-be-bc
+        src: pypi
+
+    - name: default
+      deps:
+      - name: zuspec-rt-core
+        src: pypi
