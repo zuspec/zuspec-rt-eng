@@ -73,6 +73,14 @@ def _lower(vars_, constraints, seed=None):
     return lower_scenario([coro])
 
 
+def _lower_items(vars_, items, arrays=None):
+    """Lower a solve problem whose constraints are already Constraint objects."""
+    problem = SC.ScSolveProblem(vars=list(vars_), constraints=list(items),
+                                writeback={v.name: v.var_id for v in vars_},
+                                arrays=dict(arrays or {}))
+    return lower_scenario([SC.ScCoroutine(name="root", body=[problem], frame_locals=[])])
+
+
 def _diff(model, nfields):
     """Run oracle (blob-solving) + native engine on the lowered model."""
     obj = Obj(field_names=["f%d" % i for i in range(nfields)], values=[0] * nfields)
@@ -159,6 +167,116 @@ def test_constraint_or_of_in_range(dv):
     model = _lower([_var(0)], [e])
     f = _diff(model, 1)
     assert 0 <= f[0] <= 10 or 200 <= f[0] <= 210
+
+
+def test_constraint_dist(dv):
+    # f0 dist { [0..3] := 1, [200..210] := 5 } -- value in the union, oracle == native.
+    model = _lower_items(
+        [_var(0)],
+        [C.ConstraintDist(target=FIELD(0), weights=[
+            C.DistWeight(rng=E.ExprRange(lower=K(0), upper=K(3))),
+            C.DistWeight(rng=E.ExprRange(lower=K(200), upper=K(210)), weight=K(5))])])
+    f = _diff(model, 1)
+    assert 0 <= f[0] <= 3 or 200 <= f[0] <= 210
+
+
+def test_constraint_cross_var_range_disjunction(dv):
+    # f0 in [10..12] || f1 in [50..52] -- ranges over two vars, encoded with boolean
+    # selector aux vars. The blob carries extra vars beyond f0/f1; the oracle and the
+    # native engine must still agree and only write back the real fields.
+    vs = [_var(0, width=8), _var(1, width=8)]
+    disj = E.ExprBool(op=E.BoolOp.Or, values=[
+        E.ExprIn(value=FIELD(0), container=E.ExprRange(lower=K(10), upper=K(12))),
+        E.ExprIn(value=FIELD(1), container=E.ExprRange(lower=K(50), upper=K(52)))])
+    model = _lower_items(vs, [C.ConstraintExpr(expr=disj)])
+    assert model.problems[0].problem_bytes
+    f = _diff(model, 2)
+    assert (10 <= f[0] <= 12) or (50 <= f[1] <= 52)
+
+
+def test_constraint_solve_before(dv):
+    # `solve f0 before f1` is a distribution-only hint dv-solve can't honour; it
+    # lowers to nothing, the hard constraint still holds, and oracle == native.
+    vs = [_var(0, width=8), _var(1, width=8)]
+    model = _lower_items(
+        vs,
+        [C.ConstraintExpr(expr=BIN(BIN(FIELD(0), E.BinOp.Add, FIELD(1)),
+                                   E.BinOp.Eq, K(42))),
+         C.ConstraintSolveBefore(before=[FIELD(0)], after=[FIELD(1)])])
+    f = _diff(model, 2)
+    assert f[0] + f[1] == 42
+
+
+def test_constraint_unique(dv):
+    # unique { f0, f1, f2 } over default 32-bit vars -- lowered to the native
+    # add_all_different (its width-32/tier-1 unsoundness is now fixed). Oracle
+    # solves the identical blob as the native engine, so they must agree.
+    vs = [_var(0), _var(1), _var(2)]
+    model = _lower_items(vs, [C.ConstraintUnique(items=[FIELD(0), FIELD(1), FIELD(2)])])
+    assert model.problems[0].problem_bytes
+    f = _diff(model, 3)
+    assert len({f[0], f[1], f[2]}) == 3
+
+
+def test_constraint_foreach_array(dv):
+    # rand arr[4] (elements at slots 0..3, array base slot 10); foreach (arr[i])
+    # arr[i] > 50 && arr[i] < 60. Unrolled per element, oracle == native.
+    vs = [_var(0, width=8), _var(1, width=8), _var(2, width=8), _var(3, width=8)]
+    arr_i = E.ExprSubscript(value=FIELD(10), slice=E.ExprRefLocal(name="i"))
+    fe = C.ConstraintForeach(
+        array=FIELD(10), index_var="i",
+        body=[C.ConstraintExpr(expr=BIN(arr_i, E.BinOp.Gt, K(50))),
+              C.ConstraintExpr(expr=BIN(arr_i, E.BinOp.Lt, K(60)))])
+    model = _lower_items(vs, [fe], arrays={10: [0, 1, 2, 3]})
+    assert model.problems[0].problem_bytes
+    f = _diff(model, 4)
+    assert all(50 < f[i] < 60 for i in range(4))
+
+
+def test_constraint_soft_dropped(dv):
+    # hard f0 >= 100 with a conflicting soft f0 == 5: the soft relaxes, the hard
+    # holds, and oracle == native on the identical blob (deterministic relaxation).
+    model = _lower_items(
+        [_var(0, width=32)],
+        [C.ConstraintExpr(expr=BIN(FIELD(0), E.BinOp.GtE, K(100))),
+         C.ConstraintSoft(expr=BIN(FIELD(0), E.BinOp.Eq, K(5)))])
+    assert model.problems[0].problem_bytes
+    f = _diff(model, 1)
+    assert f[0] >= 100                      # hard enforced, soft dropped, no hang
+
+
+def test_constraint_soft_honored(dv):
+    # soft f0 == 777 with no conflicting hard -> honored exactly on both sides.
+    model = _lower_items(
+        [_var(0, width=32)],
+        [C.ConstraintSoft(expr=BIN(FIELD(0), E.BinOp.Eq, K(777)))])
+    f = _diff(model, 1)
+    assert f[0] == 777
+
+
+def test_constraint_implies_range(dv):
+    # (f0 == 1) -> (f1 in [50..55]), with f0 forced to 1. Oracle == native, f1 in range.
+    eq1 = BIN(FIELD(0), E.BinOp.Eq, K(1))
+    in_r = E.ExprIn(value=FIELD(1), container=E.ExprRange(lower=K(50), upper=K(55)))
+    model = _lower_items(
+        [_var(0, width=8), _var(1, width=8)],
+        [C.ConstraintExpr(expr=eq1),
+         C.ConstraintImplies(antecedent=eq1, body=[C.ConstraintExpr(expr=in_r)])])
+    f = _diff(model, 2)
+    assert f[0] == 1 and 50 <= f[1] <= 55
+
+
+def test_constraint_if_else(dv):
+    # if (f0 == 1) { f1 < 10 } else { f1 > 100 }, forcing f0 to 0 -> else branch.
+    eq1 = BIN(FIELD(0), E.BinOp.Eq, K(1))
+    model = _lower_items(
+        [_var(0, width=8), _var(1, width=8)],
+        [C.ConstraintExpr(expr=BIN(FIELD(0), E.BinOp.Eq, K(0))),
+         C.ConstraintIfElse(cond=eq1,
+                            then_body=[C.ConstraintExpr(expr=BIN(FIELD(1), E.BinOp.Lt, K(10)))],
+                            else_body=[C.ConstraintExpr(expr=BIN(FIELD(1), E.BinOp.Gt, K(100)))])])
+    f = _diff(model, 2)
+    assert f[0] == 0 and f[1] > 100
 
 
 def test_constraint_slot_differs_from_var_id(dv):
