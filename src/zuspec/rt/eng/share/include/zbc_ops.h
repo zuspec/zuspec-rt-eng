@@ -22,6 +22,9 @@
 /* P1.5, component attributes: refused at load until P8. */
 #define ZBC_OP_LD_COMP   0x16
 #define ZBC_OP_ST_COMP   0x17
+/* A called (recursive) function's arguments (bc procedural gaps B-D5). */
+#define ZBC_OP_ARG       0x18   /* arg0 = rs; arg1 = i: stage argument i of the next CALL */
+#define ZBC_OP_LD_ARG    0x19   /* arg0 = rd; arg1 = i: this frame's argument i */
 
 /* Arithmetic / logic */
 #define ZBC_OP_ADD       0x20
@@ -64,6 +67,17 @@
  * using either is refused before it runs (zbc_run). */
 #define ZBC_OP_SCOPE_ENTER 0x4A
 #define ZBC_OP_SOLVE_NODE  0x4B
+/* A recursive function: call coroutine arg0 now, nested, in this frame's object
+ * and base, with the staged arguments; its RET value lands in arg1
+ * (0xFFFFFFFF: none). */
+#define ZBC_OP_CALL        0x4C
+
+/* IMPORT fn_ids at and above this are interpreter builtins (model.BUILTIN_*). */
+#define ZBC_BUILTIN_BASE      0xFFFFFF00u
+#define ZBC_BUILTIN_MESSAGE   (ZBC_BUILTIN_BASE + 0)
+#define ZBC_BUILTIN_ERROR     (ZBC_BUILTIN_BASE + 1)   /* an LRM "shall" error: halts */
+#define ZBC_BUILTIN_MEM_FIRST (ZBC_BUILTIN_BASE + 2)   /* read8..64, write8..64: refused */
+#define ZBC_BUILTIN_MEM_LAST  (ZBC_BUILTIN_BASE + 9)
 
 /* Instruction flags */
 #define ZBC_F_FROM_POOL  0x01
@@ -71,5 +85,6 @@
 #define ZBC_F_HAS_RET    0x04
 #define ZBC_F_NODE       0x08   /* INVOKE: callee is a node at base + imm */
 #define ZBC_F_INITED     0x10   /* INVOKE: callee starts at arg3 (P1.4; refused) */
+#define ZBC_F_SPIN       0x20   /* YIELD: waiting on a condition (channel; refused) */
 
 #endif /* ZUSPEC_ZBC_OPS_H */

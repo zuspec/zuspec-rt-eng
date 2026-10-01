@@ -19,7 +19,7 @@ pytest.importorskip("zuspec.be.bc")
 
 from zuspec.be.bc.model import (
     ZbcModel, CoroDescriptor, Instr, Op, INSTR_F_BLOCKING, INSTR_F_NODE,
-    INSTR_F_INITED,
+    INSTR_F_INITED, INSTR_F_SPIN,
 )
 from zuspec.be.bc.interp import run_model, Obj
 
@@ -92,4 +92,16 @@ def test_an_initialized_traversal_is_refused_before_anything_runs(eng):
     res = run_image(eng, model.to_bytes(), fields=fields)
     assert res.status == ZBC_ERR_UNSUPPORTED_OP
     assert res.halted_op == int(Op.INVOKE)
+    assert fields == [0]
+
+
+def test_a_spin_yield_is_refused_before_anything_runs(eng):
+    """A blocking channel wait (bc procedural gaps B-D4): its deadlock check is
+    the oracle's, so the engine refuses it rather than risk spinning."""
+    model = _model([("root", [C(0, 9), ST(0, 0),
+                              Instr(Op.YIELD, flags=INSTR_F_SPIN), RET()])])
+    fields = [0]
+    res = run_image(eng, model.to_bytes(), fields=fields)
+    assert res.status == ZBC_ERR_UNSUPPORTED_OP
+    assert res.halted_op == int(Op.YIELD)
     assert fields == [0]

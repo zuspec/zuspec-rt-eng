@@ -24,6 +24,8 @@ extern "C" {
 #define ZBC_MAX_REGS    64
 #define ZBC_MAX_LOCALS  32
 #define ZBC_MAX_CHILDREN 64   /* max joinable children a single JOIN can await */
+#define ZBC_CALL_MAX_ARGS  16    /* arguments a CALL passes (model.CALL_MAX_ARGS) */
+#define ZBC_CALL_MAX_DEPTH 1024  /* CALL nesting a run allows (model.CALL_MAX_DEPTH) */
 
 /* Runaway-loop watchdog: max bytecode steps a single coroutine may execute
  * across its whole life (frame-resident, so it spans suspends/resumes). Real
@@ -94,7 +96,14 @@ typedef struct {
  * Task-func entrypoint. Created via:
  *   zsp_timebase_thread_create(tb, &zbc_interp_task, flags,
  *                              const zbc_image_t *img, int coro_index,
- *                              zbc_result_t *result);
+ *                              zbc_result_t *result, zbc_obj_t *obj,
+ *                              uint32_t base, uint64_t *spawn_budget,
+ *                              zbc_host_t *host, uint64_t seed,
+ *                              const uint64_t *call_args, uint32_t depth,
+ *                              zbc_result_t *run);
+ * call_args / depth are a CALL's (NULL / 0 otherwise). `result` is the root's
+ * (NULL for every other frame); `run` is the run's, shared by all frames, and
+ * receives the first error any of them halts with.
  */
 zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
                              int idx, va_list *args);

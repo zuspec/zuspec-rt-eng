@@ -33,7 +33,8 @@ static uint64_t fork_seed(uint64_t parent_state, uint32_t index) {
 typedef struct interp_locals_s {
     const zbc_image_t *img;
     const zbc_coro    *coro;
-    zbc_result_t      *result;
+    zbc_result_t      *result;    /* the root's: its final status and retval (NULL below it) */
+    zbc_result_t      *run;       /* the run's result, shared by every frame: first error wins */
     zbc_obj_t         *obj;       /* active action object (NULL if none) */
     uint32_t           base;      /* P1-D1: the object slot this frame's field 0 is */
     uint32_t           pc;
@@ -56,6 +57,11 @@ typedef struct interp_locals_s {
      * fork_seed(seed_state, child_index++) and hands the child its own stream. */
     uint64_t               seed_state;
     uint32_t               child_index;
+    /* CALL (B-D5): arguments staged for the next call, this frame's own, and
+     * its call depth. */
+    uint32_t               depth;
+    uint64_t               staged[ZBC_CALL_MAX_ARGS];
+    uint64_t               call_args[ZBC_CALL_MAX_ARGS];
     uint64_t           regs[ZBC_MAX_REGS];
     uint64_t           locals[ZBC_MAX_LOCALS];
 } interp_locals_t;
@@ -102,6 +108,14 @@ static int verify_coro(const zbc_instr *code, uint32_t n) {
             if (a0 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
             if (a1 >= n) return ZBC_ERR_BAD_TARGET;
             break;
+        case ZBC_OP_ARG: case ZBC_OP_LD_ARG:
+            if (a0 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
+            if (a1 >= ZBC_CALL_MAX_ARGS) return ZBC_ERR_OOB_LOCAL;
+            break;
+        case ZBC_OP_CALL:
+            /* arg0 is a coro index (runtime-checked); arg1 the result reg. */
+            if (a1 != 0xFFFFFFFFu && a1 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
+            break;
         case ZBC_OP_INVOKE:
             /* arg0 is a coro index (runtime-checked); arg1 is the result reg. */
             if ((in->flags & ZBC_F_HAS_RET) && a1 >= ZBC_MAX_REGS)
@@ -123,9 +137,17 @@ static int verify_coro(const zbc_instr *code, uint32_t n) {
 
 static zsp_frame_t *halt(zsp_thread_t *thread, interp_locals_t *L,
                          int status, int op, uint64_t rv) {
+    /* An error in any frame -- a nested callee's too -- is the run's, and the
+     * first one wins: a callee's error is never lost to its caller's RET. */
+    if (status != ZBC_OK && L->run && L->run->status == ZBC_OK) {
+        L->run->status = status;
+        L->run->halted_op = op;
+    }
     if (L->result) {
-        L->result->status = status;
-        L->result->halted_op = op;
+        if (L->result->status == ZBC_OK) {
+            L->result->status = status;
+            L->result->halted_op = op;
+        }
         L->result->retval = rv;
     }
     /* Notify the parent only if a JOIN actually counted this child (PAR-ALL).
@@ -172,6 +194,15 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
         L->spawn_budget = va_arg(*args, uint64_t *);
         L->host = va_arg(*args, zbc_host_t *);
         L->seed_state = va_arg(*args, uint64_t);   /* forked by the parent (root: run seed) */
+        const uint64_t *cargs = va_arg(*args, const uint64_t *);
+        L->depth = va_arg(*args, uint32_t);
+        L->run = va_arg(*args, zbc_result_t *);
+        if (cargs) {
+            memcpy(L->call_args, cargs, sizeof(L->call_args));
+        } else {
+            memset(L->call_args, 0, sizeof(L->call_args));
+        }
+        memset(L->staged, 0, sizeof(L->staged));
         L->child_index = 0;
         L->pc = 0;
         L->steps = ZBC_STEP_LIMIT;
@@ -201,6 +232,11 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
 
     /* Re-entered after a blocking INVOKE's callee completed: the callee's return
      * value is in thread->rval; deliver it to the caller's result register. */
+    if (L->run && L->run->status != ZBC_OK) {
+        /* Some frame failed (a callee, or a child this one joins): stop at
+         * the resume, as the oracle's raise stops the whole run. */
+        return halt(thread, L, L->run->status, L->run->halted_op, 0);
+    }
     if (L->resuming_call) {
         L->resuming_call = 0;
         if (L->call_ret_reg >= 0) {
@@ -304,7 +340,8 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
                     thread->timebase, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
                     L->img, (int)target, (zbc_result_t *)0, L->obj, cbase,
                     L->spawn_budget, L->host,
-                    fork_seed(L->seed_state, L->child_index++));
+                    fork_seed(L->seed_state, L->child_index++),
+                    (const uint64_t *)0, (uint32_t)0, L->run);
                 L->pc++;
                 break;
             }
@@ -316,7 +353,8 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
             return zsp_timebase_call(thread, &zbc_interp_task,
                                      L->img, (int)target, (zbc_result_t *)0,
                                      L->obj, cbase, L->spawn_budget, L->host,
-                                     fork_seed(L->seed_state, L->child_index++));
+                                     fork_seed(L->seed_state, L->child_index++),
+                                     (const uint64_t *)0, (uint32_t)0, L->run);
         }
 
         case ZBC_OP_SPAWN: {
@@ -338,7 +376,8 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
                 thread->timebase, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
                 L->img, (int)target, (zbc_result_t *)0, L->obj, L->base,
                 L->spawn_budget, L->host,
-                fork_seed(L->seed_state, L->child_index++));
+                fork_seed(L->seed_state, L->child_index++),
+                (const uint64_t *)0, (uint32_t)0, L->run);
             interp_locals_t *cl = zsp_frame_locals(child->leaf, interp_locals_t);
             cl->parent_locals = L;
             cl->parent_thread = thread;
@@ -455,6 +494,10 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
              * completes inline), matching the oracle's _op_import -> CONTINUE. */
             uint32_t fn_id = a0;
             uint32_t ret_slot = a1;
+            if (fn_id == ZBC_BUILTIN_ERROR) {
+                /* The oracle raises; never run on past it. */
+                return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
+            }
             uint32_t nval = (in->nargs > 2) ? (in->nargs - 2) : 0;
             if (nval > ZBC_IMPORT_MAX_ARGS) nval = ZBC_IMPORT_MAX_ARGS;
             uint64_t argv[ZBC_IMPORT_MAX_ARGS];
@@ -551,7 +594,33 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
             return zsp_timebase_call(thread, &zbc_interp_task,
                                      L->img, (int)target, (zbc_result_t *)0,
                                      L->obj, L->base, L->spawn_budget, L->host,
-                                     fork_seed(L->seed_state, L->child_index++));
+                                     fork_seed(L->seed_state, L->child_index++),
+                                     (const uint64_t *)0, (uint32_t)0, L->run);
+        }
+
+        case ZBC_OP_ARG:    L->staged[a1] = L->regs[a0]; L->pc++; break;
+        case ZBC_OP_LD_ARG: L->regs[a0] = L->call_args[a1]; L->pc++; break;
+
+        case ZBC_OP_CALL: {
+            /* A called function (B-D5): nested on this thread like a blocking
+             * INVOKE, so it runs at once and we resume when it returns. It
+             * shares our object, base and seed state, and forks no seed (a
+             * function draws nothing; the oracle's call forks none either). */
+            uint32_t target = a0;
+            if (target >= L->img->coro_count) {
+                return halt(thread, L, ZBC_ERR_BAD_TARGET, in->op, 0);
+            }
+            if (L->depth >= ZBC_CALL_MAX_DEPTH) {
+                return halt(thread, L, ZBC_ERR_CALL_DEPTH, in->op, 0);
+            }
+            L->pc++;
+            L->call_ret_reg = (a1 == 0xFFFFFFFFu) ? -1 : (int)a1;
+            L->resuming_call = 1;
+            return zsp_timebase_call(thread, &zbc_interp_task,
+                                     L->img, (int)target, (zbc_result_t *)0,
+                                     L->obj, L->base, L->spawn_budget, L->host,
+                                     L->seed_state, (const uint64_t *)L->staged,
+                                     L->depth + 1, L->run);
         }
 
         case ZBC_OP_RET: {

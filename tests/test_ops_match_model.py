@@ -50,3 +50,4 @@ def test_instr_flags_match_model():
     assert flags["HAS_RET"] == m.INSTR_F_HAS_RET
     assert flags["NODE"] == m.INSTR_F_NODE
     assert flags["INITED"] == m.INSTR_F_INITED
+    assert flags["SPIN"] == m.INSTR_F_SPIN
