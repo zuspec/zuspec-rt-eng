@@ -2,6 +2,7 @@
  * zbc_engine.c -- see zbc_engine.h.
  */
 #include "zbc_engine.h"
+#include "zbc_ops.h"
 #include "zsp_timebase.h"
 #include "zsp_alloc.h"
 
@@ -24,6 +25,22 @@ int zbc_run(const void *data, size_t size,
     zsp_alloc_t *alloc = zsp_alloc_malloc_create();
     zsp_timebase_t *tb = zsp_timebase_create(alloc, ZSP_TIME_PS);
 
+    /* The activation solve scope (SCOPE_ENTER / SOLVE_NODE) and traversal
+     * initializers (an INVOKE that starts its callee past its initial
+     * values), P1.4, are the Python oracle's alone until P8 ports them.
+     * Refuse an image that uses them before running anything, naming the
+     * opcode, rather than run a model whose cone constraints or initializers
+     * would not hold (P1-D6). */
+    for (uint32_t i = 0; i < img.code_count; i++) {
+        uint32_t op = img.code[i].op;
+        if (op == ZBC_OP_SCOPE_ENTER || op == ZBC_OP_SOLVE_NODE
+                || (op == ZBC_OP_INVOKE && (img.code[i].flags & ZBC_F_INITED))) {
+            out->status = ZBC_ERR_UNSUPPORTED_OP;
+            out->halted_op = (int)op;
+            return out->status;
+        }
+    }
+
     zbc_obj_t obj = { fields, nfields };
     zbc_obj_t *objp = (fields != NULL && nfields > 0) ? &obj : NULL;
 
@@ -37,7 +54,8 @@ int zbc_run(const void *data, size_t size,
      * IMPORT seam, threaded to every coroutine like the spawn budget. */
     zsp_timebase_thread_create(
         tb, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
-        &img, (int)img.entry_coro, out, objp, &spawn_budget, host, (uint64_t)0);
+        &img, (int)img.entry_coro, out, objp, (uint32_t)0, &spawn_budget, host,
+        (uint64_t)0);
 
     /* Drive to quiescence: run all ready, advance to the next timed batch. */
     for (;;) {

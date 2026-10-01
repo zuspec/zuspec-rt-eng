@@ -57,10 +57,16 @@
 #define ZBC_OP_BIND      0x47
 #define ZBC_OP_YIELD     0x48
 #define ZBC_OP_IMPORT    0x49
+/* P1.4 activation solve scope: NOT implemented natively until P8 -- an image
+ * using either is refused before it runs (zbc_run). */
+#define ZBC_OP_SCOPE_ENTER 0x4A
+#define ZBC_OP_SOLVE_NODE  0x4B
 
 /* Instruction flags */
 #define ZBC_F_FROM_POOL  0x01
 #define ZBC_F_BLOCKING   0x02
 #define ZBC_F_HAS_RET    0x04
+#define ZBC_F_NODE       0x08   /* INVOKE: callee is a node at base + imm */
+#define ZBC_F_INITED     0x10   /* INVOKE: callee starts at arg3 (P1.4; refused) */
 
 #endif /* ZUSPEC_ZBC_OPS_H */

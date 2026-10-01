@@ -35,6 +35,7 @@ typedef struct interp_locals_s {
     const zbc_coro    *coro;
     zbc_result_t      *result;
     zbc_obj_t         *obj;       /* active action object (NULL if none) */
+    uint32_t           base;      /* P1-D1: the object slot this frame's field 0 is */
     uint32_t           pc;
     uint64_t           steps;     /* remaining step budget (frame-resident) */
     int                resuming_call;  /* re-entered from a blocking INVOKE */
@@ -167,6 +168,7 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
         L->coro   = &L->img->coros[coro_index];
         L->result = va_arg(*args, zbc_result_t *);
         L->obj    = va_arg(*args, zbc_obj_t *);
+        L->base   = va_arg(*args, uint32_t);
         L->spawn_budget = va_arg(*args, uint64_t *);
         L->host = va_arg(*args, zbc_host_t *);
         L->seed_state = va_arg(*args, uint64_t);   /* forked by the parent (root: run seed) */
@@ -232,12 +234,14 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
 
         case ZBC_OP_LD_FIELD:
             if (!L->obj) return halt(thread, L, ZBC_ERR_NO_OBJ, in->op, 0);
-            if (a1 >= L->obj->n) return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
-            L->regs[a0] = L->obj->slots[a1]; L->pc++; break;
+            if ((uint64_t)L->base + a1 >= L->obj->n)
+                return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
+            L->regs[a0] = L->obj->slots[L->base + a1]; L->pc++; break;
         case ZBC_OP_ST_FIELD:
             if (!L->obj) return halt(thread, L, ZBC_ERR_NO_OBJ, in->op, 0);
-            if (a1 >= L->obj->n) return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
-            L->obj->slots[a1] = L->regs[a0]; L->pc++; break;
+            if ((uint64_t)L->base + a1 >= L->obj->n)
+                return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
+            L->obj->slots[L->base + a1] = L->regs[a0]; L->pc++; break;
 
         case ZBC_OP_ADD: L->regs[a0] = L->regs[a1] + L->regs[a2]; L->pc++; break;
         case ZBC_OP_SUB: L->regs[a0] = L->regs[a1] - L->regs[a2]; L->pc++; break;
@@ -285,6 +289,10 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
             if (target >= L->img->coro_count) {
                 return halt(thread, L, ZBC_ERR_BAD_TARGET, in->op, 0);
             }
+            /* A node of this activation runs on our object, imm slots past our
+             * base (P1-D1); otherwise the callee shares our base. */
+            uint32_t cbase = (in->flags & ZBC_F_NODE)
+                ? L->base + (uint32_t)in->imm : L->base;
             if (!(in->flags & ZBC_F_BLOCKING)) {
                 /* Non-blocking INVOKE: fire-and-forget. Fork a fully detached
                  * child (counted == 0, no parent back-link) and continue. */
@@ -294,7 +302,8 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
                 if (L->spawn_budget) (*L->spawn_budget)--;
                 zsp_timebase_thread_create(
                     thread->timebase, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
-                    L->img, (int)target, (zbc_result_t *)0, L->obj, L->spawn_budget, L->host,
+                    L->img, (int)target, (zbc_result_t *)0, L->obj, cbase,
+                    L->spawn_budget, L->host,
                     fork_seed(L->seed_state, L->child_index++));
                 L->pc++;
                 break;
@@ -306,7 +315,7 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
              * shares our object; its rval is delivered on our re-entry. */
             return zsp_timebase_call(thread, &zbc_interp_task,
                                      L->img, (int)target, (zbc_result_t *)0,
-                                     L->obj, L->spawn_budget, L->host,
+                                     L->obj, cbase, L->spawn_budget, L->host,
                                      fork_seed(L->seed_state, L->child_index++));
         }
 
@@ -327,7 +336,8 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
             if (L->spawn_budget) (*L->spawn_budget)--;
             zsp_thread_t *child = zsp_timebase_thread_create(
                 thread->timebase, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
-                L->img, (int)target, (zbc_result_t *)0, L->obj, L->spawn_budget, L->host,
+                L->img, (int)target, (zbc_result_t *)0, L->obj, L->base,
+                L->spawn_budget, L->host,
                 fork_seed(L->seed_state, L->child_index++));
             interp_locals_t *cl = zsp_frame_locals(child->leaf, interp_locals_t);
             cl->parent_locals = L;
@@ -409,12 +419,13 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
                 }
                 if (L->obj) {
                     for (uint32_t i = 0; i < nwb; i++) {
-                        if (pairs[2 * i] >= L->obj->n) {
+                        if ((uint64_t)L->base + pairs[2 * i] >= L->obj->n) {
                             return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
                         }
                     }
+                    /* Writeback slots are relative to the frame's base. */
                     int sr = zbc_solver_run(L->img->sprob + p->prob_off, seed,
-                                            pairs, nwb, L->obj->slots);
+                                            pairs, nwb, L->obj->slots + L->base);
                     if (sr == ZBC_SOLVER_UNSAT) {
                         return halt(thread, L, ZBC_ERR_SOLVE_UNSAT, in->op, 0);
                     }
@@ -424,7 +435,8 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
                 }
             } else if (L->obj) {
                 for (uint32_t i = 0; i < nwb; i++) {
-                    uint32_t slot = pairs[2 * i], var_id = pairs[2 * i + 1];
+                    uint64_t slot = (uint64_t)L->base + pairs[2 * i];
+                    uint32_t var_id = pairs[2 * i + 1];
                     if (slot >= L->obj->n) {
                         return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
                     }
@@ -538,7 +550,7 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
             L->resuming_call = 1;
             return zsp_timebase_call(thread, &zbc_interp_task,
                                      L->img, (int)target, (zbc_result_t *)0,
-                                     L->obj, L->spawn_budget, L->host,
+                                     L->obj, L->base, L->spawn_budget, L->host,
                                      fork_seed(L->seed_state, L->child_index++));
         }
 

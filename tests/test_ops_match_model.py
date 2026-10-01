@@ -48,3 +48,5 @@ def test_instr_flags_match_model():
     assert flags["FROM_POOL"] == m.INSTR_F_FROM_POOL
     assert flags["BLOCKING"] == m.INSTR_F_BLOCKING
     assert flags["HAS_RET"] == m.INSTR_F_HAS_RET
+    assert flags["NODE"] == m.INSTR_F_NODE
+    assert flags["INITED"] == m.INSTR_F_INITED
