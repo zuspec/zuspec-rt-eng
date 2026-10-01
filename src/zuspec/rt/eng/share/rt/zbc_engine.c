@@ -25,15 +25,25 @@ int zbc_run(const void *data, size_t size,
     zsp_alloc_t *alloc = zsp_alloc_malloc_create();
     zsp_timebase_t *tb = zsp_timebase_create(alloc, ZSP_TIME_PS);
 
+    /* The component tree (P1.5): a coroutine that constructs it before the
+     * entry, which this engine does not run. Refused rather than skipped, so
+     * an init block's side effects are never silently lost (P1-D6). */
+    if (img.hdr->flags & ZBC_HDR_COMP_INIT) {
+        out->status = ZBC_ERR_COMP_INIT;
+        return out->status;
+    }
+
     /* The activation solve scope (SCOPE_ENTER / SOLVE_NODE) and traversal
      * initializers (an INVOKE that starts its callee past its initial
-     * values), P1.4, are the Python oracle's alone until P8 ports them.
-     * Refuse an image that uses them before running anything, naming the
-     * opcode, rather than run a model whose cone constraints or initializers
-     * would not hold (P1-D6). */
+     * values), P1.4, and component attributes (LD_COMP / ST_COMP), P1.5,
+     * are the Python oracle's alone until P8 ports them. Refuse an image
+     * that uses them before running anything, naming the opcode, rather
+     * than run a model whose cone constraints, initializers or component
+     * state would not hold (P1-D6). */
     for (uint32_t i = 0; i < img.code_count; i++) {
         uint32_t op = img.code[i].op;
         if (op == ZBC_OP_SCOPE_ENTER || op == ZBC_OP_SOLVE_NODE
+                || op == ZBC_OP_LD_COMP || op == ZBC_OP_ST_COMP
                 || (op == ZBC_OP_INVOKE && (img.code[i].flags & ZBC_F_INITED))) {
             out->status = ZBC_ERR_UNSUPPORTED_OP;
             out->halted_op = (int)op;

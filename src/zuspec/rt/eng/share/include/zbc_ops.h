@@ -19,6 +19,9 @@
 #define ZBC_OP_ST_LOCAL  0x13
 #define ZBC_OP_LD_FIELD  0x14
 #define ZBC_OP_ST_FIELD  0x15
+/* P1.5, component attributes: refused at load until P8. */
+#define ZBC_OP_LD_COMP   0x16
+#define ZBC_OP_ST_COMP   0x17
 
 /* Arithmetic / logic */
 #define ZBC_OP_ADD       0x20

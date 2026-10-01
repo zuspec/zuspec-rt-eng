@@ -43,7 +43,8 @@ enum {
     ZBC_ERR_BAD_SELECT   = -19,  /* SELECT: descriptor id / oplist range out of bounds */
     ZBC_ERR_BAD_SOLVE    = -20,  /* SOLVE: descriptor id / oplist range out of bounds */
     ZBC_ERR_SOLVE_UNSAT  = -21,  /* SOLVE: real solver reports the problem unsatisfiable */
-    ZBC_ERR_SOLVE_FAIL   = -22   /* SOLVE: real solver setup / compile / timeout failure */
+    ZBC_ERR_SOLVE_FAIL   = -22,  /* SOLVE: real solver setup / compile / timeout failure */
+    ZBC_ERR_COMP_INIT    = -23   /* the image constructs a component tree (P1.5): refused until P8 */
 };
 
 typedef struct {
