@@ -429,7 +429,7 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
              * randomizer == the oracle's FixedSolveBackend (base 0), each written
              * field slot = seed + var_id. prob_len>0: the real dv-solve path --
              * compile + solve the SPROB blob with the drawn seed and write
-             * solver_get_value(var_id) back per pair. Either way the seed is the
+             * dvs_solver_get_value(var_id) back per pair. Either way the seed is the
              * descriptor's fixed value or (inherit) the frame's next raw draw,
              * advanced even with no object, matching _op_solve's ordering. */
             uint32_t pid = a0;

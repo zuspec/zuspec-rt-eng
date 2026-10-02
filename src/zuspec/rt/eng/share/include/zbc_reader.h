@@ -77,7 +77,7 @@ typedef struct {
 
     /* Optional SPROB pool (NULL/0 if absent): raw relocatable dv-solve SolveProblem
      * blobs. A zbc_solve with prob_len>0 references (prob_off, prob_len) here; the
-     * engine hands that address straight to solver_compile() for a real solve. */
+     * engine hands that address straight to dvs_solver_compile() for a real solve. */
     const uint8_t     *sprob;
     uint32_t           sprob_count;   /* pool size in bytes */
 } zbc_image_t;

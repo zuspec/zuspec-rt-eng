@@ -25,7 +25,7 @@ enum {
 
 /*
  * Compile + solve `problem_blob` (a relocatable dv-solve SolveProblem) with
- * `seed`, then write solver_get_value(var_id) into slots[slot] for each
+ * `seed`, then write dvs_solver_get_value(var_id) into slots[slot] for each
  * (slot, var_id) pair in `pairs` (2*n_pairs u32s: slot0,var0, slot1,var1, ...).
  * Slot indices must be pre-validated in range by the caller. Returns ZBC_SOLVER_*.
  */
