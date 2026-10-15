@@ -38,9 +38,12 @@ def _build_dv_solve(build_dir: Path):
                        check=True, capture_output=True)
     except (subprocess.CalledProcessError, OSError):
         return None
-    if not list(build_dir.glob("libdv_solve.so*")):
-        return None
-    return build_dir
+    # dv-solve's build puts the library under lib/ (it used to be the build
+    # dir itself); return whichever directory holds it.
+    for d in (build_dir / "lib", build_dir):
+        if list(d.glob("libdv_solve.so*")):
+            return d
+    return None
 
 
 @pytest.fixture(scope="session")

@@ -11,7 +11,7 @@ library for the pytest+ctypes tests.
 import os
 import glob
 
-__version__ = "0.0.1"
+from .__version__ import version as __version__
 
 SHARE_DIR = os.path.join(os.path.dirname(__file__), "share")
 
