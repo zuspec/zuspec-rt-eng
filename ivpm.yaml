@@ -8,8 +8,10 @@ package:
       deps:
       - name: pytest
         src: pypi
-      - name: zuspec-be-bc
-        src: pypi
+      # Not zuspec-be-bc, though the tests use it: be-bc depends on rt-eng,
+      # so it cannot be on PyPI before rt-eng is, and CI (which runs only
+      # tests/unit, absent here) failed resolving it. Develop rt-eng beside
+      # be-bc, as pssc's packages/ does.
 
     - name: default
       deps:
