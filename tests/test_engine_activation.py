@@ -1,4 +1,4 @@
-"""P1.4: an activation is one object (P1-D1), and its solve scope is refused.
+"""P1.4: an activation is one object (P1-D1), and its solve scope runs.
 
 A traversal of a node of the activation is an INVOKE with ``INSTR_F_NODE``: the
 callee runs on the caller's object, ``imm`` slots past the caller's base, so
@@ -6,11 +6,13 @@ every field access and SOLVE write-back is relative to the frame's base. The
 oracle and the engine must agree on that operand -- they used to disagree on
 INVOKE's object altogether (the oracle gave a callee a fresh one).
 
-``SCOPE_ENTER`` / ``SOLVE_NODE`` (the cone solve, LRM 13.4.9) and an INVOKE
-that starts its callee past its initial values (``INSTR_F_INITED``, traversal
-initializers, 11.3.1 b) run on the oracle only until P8: the engine refuses an
-image that uses them before running any of it, naming the opcode (P1-D6),
-instead of running it with the cone constraints or initializers dropped.
+An INVOKE that starts its callee past its initial values (``INSTR_F_INITED``,
+traversal initializers, 11.3.1 b) runs as on the oracle: the caller has
+written the initializers into the callee's slots.
+
+``SCOPE_ENTER`` / ``SOLVE_NODE`` (the cone solve, LRM 13.4.9) run on the engine
+since P4.10d1; without an activation table there is no cone, so a SOLVE_NODE
+with no problem only commits and the code after it runs.
 """
 
 import pytest
@@ -19,13 +21,14 @@ pytest.importorskip("zuspec.be.bc")
 
 from zuspec.be.bc.model import (
     ZbcModel, CoroDescriptor, Instr, Op, INSTR_F_BLOCKING, INSTR_F_NODE,
-    INSTR_F_INITED, INSTR_F_SPIN,
+    INSTR_F_INITED,
 )
 from zuspec.be.bc.interp import run_model, Obj
 
 from conftest import run_image
 
 ZBC_ERR_UNSUPPORTED_OP = -8
+ZBC_ERR_BAD_TARGET = -12
 
 
 def C(rd, v):
@@ -73,35 +76,48 @@ def test_a_node_runs_at_its_base_on_the_callers_object(eng):
 
 
 @pytest.mark.parametrize("op", [Op.SCOPE_ENTER, Op.SOLVE_NODE])
-def test_the_activation_solve_scope_is_refused_before_anything_runs(eng, op):
+def test_the_activation_solve_scope_runs_without_an_activation_table(eng, op):
     ins = Instr(op, imm=0) if op == Op.SCOPE_ENTER else Instr(op, args=(0xFFFFFFFF,))
     model = _model([("root", [C(0, 9), ST(0, 0), ins, RET()])])
     fields = [0]
     res = run_image(eng, model.to_bytes(), fields=fields)
-    assert res.status == ZBC_ERR_UNSUPPORTED_OP
-    assert res.halted_op == int(op)
-    assert fields == [0]          # refused at load: the store never ran
+    assert res.status == 0
+    assert fields == [9]
 
 
-def test_an_initialized_traversal_is_refused_before_anything_runs(eng):
-    inited = Instr(Op.INVOKE, args=(1, 0, 0, 0), imm=0,
-                   flags=INSTR_F_BLOCKING | INSTR_F_NODE | INSTR_F_INITED)
-    model = _model([("root", [C(0, 9), ST(0, 0), inited, RET()]),
-                    ("child", [RET()])])
-    fields = [0]
-    res = run_image(eng, model.to_bytes(), fields=fields)
-    assert res.status == ZBC_ERR_UNSUPPORTED_OP
-    assert res.halted_op == int(Op.INVOKE)
-    assert fields == [0]
+def _inited(target, child_base, start, blocking=True):
+    flags = INSTR_F_NODE | INSTR_F_INITED | (INSTR_F_BLOCKING if blocking else 0)
+    return Instr(Op.INVOKE, args=(target, 0, 0, start), imm=child_base, flags=flags)
 
 
-def test_a_spin_yield_is_refused_before_anything_runs(eng):
-    """A blocking channel wait (bc procedural gaps B-D4): its deadlock check is
-    the oracle's, so the engine refuses it rather than risk spinning."""
-    model = _model([("root", [C(0, 9), ST(0, 0),
-                              Instr(Op.YIELD, flags=INSTR_F_SPIN), RET()])])
-    fields = [0]
-    res = run_image(eng, model.to_bytes(), fields=fields)
-    assert res.status == ZBC_ERR_UNSUPPORTED_OP
-    assert res.halted_op == int(Op.YIELD)
-    assert fields == [0]
+# child: its default (field 0 = 5) at pc 0-1, then field 1 = field 0.
+_CHILD = ("child", [C(0, 5), ST(0, 0), LD(0, 0), ST(0, 1), RET()])
+
+
+@pytest.mark.parametrize("blocking", [True, False])
+def test_an_initialized_traversal_starts_past_its_defaults(eng, blocking):
+    # root writes the initializer 9 into the child's field 0 (slot 2) and
+    # traverses it from pc 2, so the default 5 is never stored.
+    tail = [RET()] if blocking else [Instr(Op.JOIN, imm=0), RET()]
+    model = _model([("root", [C(0, 9), ST(0, 2), _inited(1, 2, 2, blocking)] + tail),
+                    _CHILD])
+    fields = [0] * 4
+    o = run_model(model, obj=Obj(field_names=["f%d" % i for i in range(4)]), seed=0)
+    native = run_image(eng, model.to_bytes(), fields=fields)
+    assert native.status == 0
+    assert fields == list(o.obj.values) == [0, 0, 9, 9]
+
+
+def test_an_uninitialized_traversal_keeps_its_defaults(eng):
+    model = _model([("root", [C(0, 9), ST(0, 2), NODE(1, 2), RET()]), _CHILD])
+    fields = [0] * 4
+    o = run_model(model, obj=Obj(field_names=["f%d" % i for i in range(4)]), seed=0)
+    native = run_image(eng, model.to_bytes(), fields=fields)
+    assert native.status == 0
+    assert fields == list(o.obj.values) == [0, 0, 5, 5]
+
+
+def test_a_start_past_the_callee_halts(eng):
+    model = _model([("root", [_inited(1, 0, 99), RET()]), _CHILD])
+    res = run_image(eng, model.to_bytes(), fields=[0] * 4)
+    assert res.status == ZBC_ERR_BAD_TARGET

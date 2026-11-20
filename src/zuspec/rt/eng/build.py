@@ -27,6 +27,13 @@ def build_shared_lib(out_path: str,
     constraint solver (libdv_solve) for the native SOLVE path.
     """
     srcs = list(source_files()) + list(extra_sources or [])
+    # The engine refers to libdv_solve weakly (zbc_solver.c), and a linker
+    # defaulting to --as-needed records no dependency for weak references
+    # only: keep every library named here.
+    if extra_link_args:
+        extra_link_args = ["-Wl,--no-as-needed"] + list(extra_link_args)
+    # pssvm_stub.c runs a debug session across threads (pthreads).
+    extra_link_args = list(extra_link_args or []) + ["-pthread"]
     incs = [include_dir()] + list(extra_include_dirs or [])
     # core_build.build_shared_lib prepends the rt-core substrate sources + include.
     return core_build.build_shared_lib(

@@ -76,8 +76,10 @@
 #define ZBC_BUILTIN_BASE      0xFFFFFF00u
 #define ZBC_BUILTIN_MESSAGE   (ZBC_BUILTIN_BASE + 0)
 #define ZBC_BUILTIN_ERROR     (ZBC_BUILTIN_BASE + 1)   /* an LRM "shall" error: halts */
-#define ZBC_BUILTIN_MEM_FIRST (ZBC_BUILTIN_BASE + 2)   /* read8..64, write8..64: refused */
+#define ZBC_BUILTIN_MEM_FIRST (ZBC_BUILTIN_BASE + 2)   /* read8..64, write8..64: host mem_access */
 #define ZBC_BUILTIN_MEM_LAST  (ZBC_BUILTIN_BASE + 9)
+#define ZBC_BUILTIN_ERROR_MSG (ZBC_BUILTIN_BASE + 10)  /* error(fmt, ...): logged, then halts */
+#define ZBC_BUILTIN_FATAL_MSG (ZBC_BUILTIN_BASE + 11)  /* fatal(status, fmt, ...): logged, then halts */
 
 /* Instruction flags */
 #define ZBC_F_FROM_POOL  0x01
@@ -85,6 +87,6 @@
 #define ZBC_F_HAS_RET    0x04
 #define ZBC_F_NODE       0x08   /* INVOKE: callee is a node at base + imm */
 #define ZBC_F_INITED     0x10   /* INVOKE: callee starts at arg3 (P1.4; refused) */
-#define ZBC_F_SPIN       0x20   /* YIELD: waiting on a condition (channel; refused) */
+#define ZBC_F_SPIN       0x20   /* YIELD: waiting on a condition (channel get/put) */
 
 #endif /* ZUSPEC_ZBC_OPS_H */

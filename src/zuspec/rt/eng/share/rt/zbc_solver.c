@@ -38,15 +38,20 @@ _Static_assert(sizeof(zbc_dv_solve_opts_t) == 32 &&
                offsetof(zbc_dv_solve_opts_t, time_limit_ms) == 24,
                "zbc_dv_solve_opts_t must match dv-solve's dvs_solve_opts_t");
 
-extern void   *dvs_block_alloc_create(void *alloc, size_t block_size);
-extern void    dvs_block_alloc_destroy(void *ba);
-extern void   *dvs_solver_create(void *static_buf, size_t static_size, void *block_alloc);
-extern int     dvs_solver_compile(void *ctx, void *sp);
-extern int     dvs_solver_solve(void *ctx, const zbc_dv_solve_opts_t *opts);
-extern int64_t dvs_solver_get_value(const void *ctx, uint32_t var_id);
-extern void    dvs_solver_destroy(void *ctx);
-extern int     dvs_solver_checkpoint(void *ctx);
-extern void    dvs_solver_restore(void *ctx, uint32_t cp);
+/* Weak: the engine loads without libdv_solve (a host links it only for images
+ * with solves); a SOLVE then fails with ZBC_SOLVER_FAIL instead of the load. */
+#define ZBC_DVS __attribute__((weak))
+ZBC_DVS extern void   *dvs_block_alloc_create(void *alloc, size_t block_size);
+ZBC_DVS extern void    dvs_block_alloc_destroy(void *ba);
+ZBC_DVS extern void   *dvs_solver_create(void *static_buf, size_t static_size, void *block_alloc);
+ZBC_DVS extern int     dvs_solver_compile(void *ctx, void *sp);
+ZBC_DVS extern int     dvs_solver_solve(void *ctx, const zbc_dv_solve_opts_t *opts);
+ZBC_DVS extern int64_t dvs_solver_get_value(const void *ctx, uint32_t var_id);
+ZBC_DVS extern void    dvs_solver_destroy(void *ctx);
+ZBC_DVS extern int     dvs_solver_checkpoint(void *ctx);
+ZBC_DVS extern void    dvs_solver_restore(void *ctx, uint32_t cp);
+ZBC_DVS extern int     dvs_solver_add_constraint(void *ctx, void *sp);
+ZBC_DVS extern int     dvs_solver_pin_var(void *ctx, uint32_t var_id, int64_t value);
 
 /* The oracle's solve (be-bc interp/solve_cache.py, SolveCache.solve), step for
  * step, so both draw the same values: a short clause-learning search first,
@@ -63,6 +68,9 @@ int zbc_solver_run(const void *problem_blob, uint64_t seed,
                    const uint32_t *pairs, uint32_t n_pairs,
                    uint64_t *slots) {
     int rc = ZBC_SOLVER_FAIL;
+    if (!dvs_solver_create) {
+        return ZBC_SOLVER_FAIL;   /* libdv_solve not linked */
+    }
     void *ctx_buf = malloc(ZBC_SOLVER_CTX_SIZE);
     if (!ctx_buf) {
         return ZBC_SOLVER_FAIL;
@@ -124,6 +132,82 @@ int zbc_solver_run(const void *problem_blob, uint64_t seed,
 
 done:
     dvs_solver_destroy(ctx);           /* frees the clause-learning state */
+    dvs_block_alloc_destroy(ba);
+    free(ctx_buf);
+    return rc;
+}
+
+/* One solve of an activation cone (pyvm activation.py `_attempt` through
+ * SolveCache): compile `base`, add each of `adds` (the constraints in force),
+ * checkpoint, pin, then the same two searches as zbc_solver_run. On success
+ * vals[i] = the value of cone variable i for i < n_vals. A compile-time or
+ * pin conflict is UNSAT, as pyvm's "no solution". */
+int zbc_solver_cone(const void *base, const void *const *adds, uint32_t n_adds,
+                    const uint32_t *pin_var, const int64_t *pin_val, uint32_t n_pins,
+                    uint64_t seed, int64_t *vals, uint32_t n_vals) {
+    int rc = ZBC_SOLVER_FAIL;
+    if (!dvs_solver_create || (n_adds && !dvs_solver_add_constraint)
+            || (n_pins && !dvs_solver_pin_var)) {
+        return ZBC_SOLVER_FAIL;
+    }
+    void *ctx_buf = malloc(ZBC_SOLVER_CTX_SIZE);
+    if (!ctx_buf) return ZBC_SOLVER_FAIL;
+    void *ba = dvs_block_alloc_create(NULL, ZBC_SOLVER_CTX_SIZE);
+    if (!ba) {
+        free(ctx_buf);
+        return ZBC_SOLVER_FAIL;
+    }
+    void *ctx = dvs_solver_create(ctx_buf, ZBC_SOLVER_CTX_SIZE, ba);
+    if (!ctx) {
+        dvs_block_alloc_destroy(ba);
+        free(ctx_buf);
+        return ZBC_SOLVER_FAIL;
+    }
+    int crc = dvs_solver_compile(ctx, (void *)base);
+    if (crc != 0) {
+        rc = crc == -2 ? ZBC_SOLVER_UNSAT : ZBC_SOLVER_FAIL;
+        goto done;
+    }
+    for (uint32_t i = 0; i < n_adds; i++) {
+        crc = dvs_solver_add_constraint(ctx, (void *)adds[i]);
+        if (crc != 0) {
+            rc = crc == -2 ? ZBC_SOLVER_UNSAT : ZBC_SOLVER_FAIL;
+            goto done;
+        }
+    }
+    (void)dvs_solver_checkpoint(ctx);     /* pyvm pins inside a session */
+    for (uint32_t i = 0; i < n_pins; i++) {
+        if (dvs_solver_pin_var(ctx, pin_var[i], pin_val[i]) != 0) {
+            rc = ZBC_SOLVER_UNSAT;
+            goto done;
+        }
+    }
+
+    zbc_dv_solve_opts_t opts = {0};
+    opts.seed = seed;
+    opts.max_restarts = ZBC_MAX_RESTARTS;
+    int sr;
+    {
+        zbc_dv_solve_opts_t lopts = opts;
+        lopts.use_lcg = 1;
+        lopts.max_restarts = ZBC_LCG_RESTARTS;
+        int cp = dvs_solver_checkpoint(ctx);
+        sr = dvs_solver_solve(ctx, &lopts);
+        if (sr != 0 && cp >= 0)
+            dvs_solver_restore(ctx, (uint32_t)cp);
+    }
+    if (sr != 0)
+        sr = dvs_solver_solve(ctx, &opts);
+    if (sr != 0) {
+        rc = sr == 1 ? ZBC_SOLVER_UNSAT : ZBC_SOLVER_FAIL;
+        goto done;
+    }
+    for (uint32_t i = 0; i < n_vals; i++)
+        vals[i] = dvs_solver_get_value(ctx, i);
+    rc = ZBC_SOLVER_OK;
+
+done:
+    dvs_solver_destroy(ctx);
     dvs_block_alloc_destroy(ba);
     free(ctx_buf);
     return rc;

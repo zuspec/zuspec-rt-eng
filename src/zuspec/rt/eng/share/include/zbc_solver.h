@@ -33,6 +33,16 @@ int zbc_solver_run(const void *problem_blob, uint64_t seed,
                    const uint32_t *pairs, uint32_t n_pairs,
                    uint64_t *slots);
 
+/*
+ * Solve an activation cone: compile `base`, add the blobs `adds[0..n_adds)`,
+ * pin cone variable pin_var[i] to pin_val[i], solve with `seed`, and write the
+ * value of cone variables 0..n_vals-1 to vals. Returns ZBC_SOLVER_* (a pin or
+ * compile conflict is ZBC_SOLVER_UNSAT).
+ */
+int zbc_solver_cone(const void *base, const void *const *adds, uint32_t n_adds,
+                    const uint32_t *pin_var, const int64_t *pin_val, uint32_t n_pins,
+                    uint64_t seed, int64_t *vals, uint32_t n_vals);
+
 #ifdef __cplusplus
 }
 #endif

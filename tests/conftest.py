@@ -32,7 +32,10 @@ def _build_dv_solve(build_dir: Path):
         return None
     build_dir.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run(["cmake", str(_DV_SOLVE_DIR), "-DCMAKE_BUILD_TYPE=Release"],
+        # PACKAGES_DIR: dv-solve finds its CaDiCaL sources beside it, not at
+        # its built-in default (another checkout's packages dir).
+        subprocess.run(["cmake", str(_DV_SOLVE_DIR), "-DCMAKE_BUILD_TYPE=Release",
+                        "-DPACKAGES_DIR=" + str(_DV_SOLVE_DIR.parent)],
                        cwd=build_dir, check=True, capture_output=True)
         subprocess.run(["cmake", "--build", str(build_dir), "--parallel"],
                        check=True, capture_output=True)
@@ -95,7 +98,28 @@ class ZbcHost(ctypes.Structure):
     _fields_ = [
         ("import_log", ctypes.POINTER(ZbcImportLog)),
         ("import_returns", ctypes.POINTER(ZbcImportReturns)),
+        ("mem_access", ctypes.c_void_p),   # a MEM_ACCESS_FN, or None
+        ("mem_ctx", ctypes.c_void_p),
+        ("message", ctypes.c_void_p),      # a MESSAGE_FN, or None
+        ("msg_ctx", ctypes.c_void_p),
+        ("verbosity", ctypes.c_uint32),
+        ("yield_", ctypes.c_void_p),       # zbc_yield_t*: NULL here (pssvm sets it)
+        ("events", ctypes.c_void_p),       # zbc_ev_sink_t*: NULL = no events
+        ("dbg", ctypes.c_void_p),          # zbc_dbg_t*: NULL = no debug stops
+        ("bound", ctypes.c_void_p),        # uint8_t* per coroutine: NULL = none bound
+        ("cbase", ctypes.c_uint32),        # component instance base (0: the root)
+        ("step_limit", ctypes.c_uint64),   # per-frame step budget: 0 = ZBC_STEP_LIMIT
     ]
+
+
+#: Mirror of C ``zbc_message_f``: (ctx, severity, level, text, len).
+MESSAGE_FN = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64,
+                              ctypes.c_char_p, ctypes.c_uint32)
+
+
+#: Mirror of C ``zbc_mem_access_f``: (ctx, is_write, addr, nbytes, data) -> u64.
+MEM_ACCESS_FN = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+                                 ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint64)
 
 
 @pytest.fixture(scope="session")

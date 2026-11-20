@@ -120,7 +120,8 @@ def test_an_error_in_a_nested_callee_is_the_runs(eng, op, flags):
 
 
 def test_a_memory_builtin_is_refused_before_anything_runs(eng):
-    """The engine has no platform memory to answer from (B-D6)."""
+    """With no host mem_access, the engine has no platform memory to answer
+    from (B-D6); test_engine_memory.py runs it with one."""
     from zuspec.be.bc.model import BUILTIN_READ, INSTR_F_HAS_RET
     model = _model([("root", [C(0, 9), Instr(Op.ST_FIELD, args=(0, 0)),
                               Instr(Op.IMPORT, args=(BUILTIN_READ[32], 1, 0),
@@ -142,3 +143,29 @@ def test_a_builtin_error_stops_the_run(eng):
     assert res.status == -25                    # ZBC_ERR_RUNTIME
     with pytest.raises(VMError, match="boom"):
         run_model(model)
+
+
+def _many_calls(n):
+    """root: acc = 0; repeat n { acc = inc(acc) }; return acc. Depth 1, n calls."""
+    return _model([
+        ("root", [C(0, n), C(1, 0), C(2, 1), C(3, 0),        # n, acc, one, zero
+                  Instr(Op.CMP_EQ, args=(4, 0, 3)),            # 4: loop
+                  Instr(Op.BRZ, args=(4, 7)),
+                  Instr(Op.RET, args=(1,)),
+                  Instr(Op.ARG, args=(1, 0)),                  # 7: body
+                  Instr(Op.CALL, args=(1, 1)),
+                  Instr(Op.SUB, args=(0, 0, 2)),
+                  Instr(Op.BR, args=(4,))]),
+        ("inc", [Instr(Op.LD_ARG, args=(0, 0)), C(1, 1),
+                 Instr(Op.ADD, args=(2, 0, 1)), Instr(Op.RET, args=(2,))]),
+    ])
+
+
+def test_many_sequential_calls_do_not_grow_the_c_stack(eng):
+    """Each CALL that returns must unwind the C stack: 1.7 KB per call used
+    to stay live until the run ended, and ~4800 calls overflowed 8 MB."""
+    n = 200_000
+    model = _many_calls(n)
+    native = run_image(eng, model.to_bytes())
+    assert native.status == 0
+    assert native.retval == run_model(model).retval == n
