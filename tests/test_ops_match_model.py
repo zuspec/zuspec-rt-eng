@@ -64,6 +64,7 @@ def test_instr_flags_match_model():
 #: it too (lowering emits SPAWN/JOIN).
 NATIVE_OP_GAPS = {
     "PAR": "reserved (oracle rejects)",
+    "HEAP": "F6.9c heap ops; refused up front until M14",
 }
 
 #: Opcode/flag pairs the engine refuses up front (zbc_engine.c).

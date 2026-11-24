@@ -32,8 +32,9 @@ def build_shared_lib(out_path: str,
     # only: keep every library named here.
     if extra_link_args:
         extra_link_args = ["-Wl,--no-as-needed"] + list(extra_link_args)
-    # pssvm_stub.c runs a debug session across threads (pthreads).
-    extra_link_args = list(extra_link_args or []) + ["-pthread"]
+    # pssvm_stub.c runs a debug session across threads (pthreads); FMATH
+    # calls libm (zbc_interp.c).
+    extra_link_args = list(extra_link_args or []) + ["-pthread", "-lm"]
     incs = [include_dir()] + list(extra_include_dirs or [])
     # core_build.build_shared_lib prepends the rt-core substrate sources + include.
     return core_build.build_shared_lib(

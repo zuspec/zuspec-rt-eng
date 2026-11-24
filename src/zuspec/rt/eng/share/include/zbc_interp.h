@@ -34,6 +34,9 @@ extern "C" {
 #define ZBC_CALL_MAX_ARGS  32    /* arguments a CALL or host call passes: model.CALL_MAX_ARGS
                                   * (16) bounds a CALL; a host call flattens struct
                                   * parameters (wb_dma transfer_single: 18 words) */
+#define ZBC_SOLVE_MAX_INPUTS 32  /* non-rand fields one SOLVE pins (zbc_solve.n_input);
+                                  * also the SOLVE_PINs one procedural SOLVE takes */
+#define ZBC_SOLVE_MAX_VARS   64  /* vars one procedural randomize keeps (SOLVE_GET) */
 #define ZBC_CALL_MAX_DEPTH 1024  /* CALL nesting a run allows (model.CALL_MAX_DEPTH) */
 
 /* Runaway-loop watchdog: max bytecode steps a single coroutine may execute
@@ -68,8 +71,9 @@ typedef struct {
     uint64_t now;         /* final sim time in ticks (driver-filled) */
 } zbc_result_t;
 
-/* Max IMPORT value args the engine records/passes (M1 lowering caps at 2). */
-#define ZBC_IMPORT_MAX_ARGS 4
+/* Max IMPORT value args the engine records/passes: 0-2 inline, more staged
+ * by ARG (F6.5b); the same cap as a CALL's (model.CALL_MAX_ARGS). */
+#define ZBC_IMPORT_MAX_ARGS 16
 
 /*
  * IMPORT host seam. IMPORT is the interpreter's window to the outside world: the
@@ -157,8 +161,11 @@ typedef struct {
     uint32_t  size;       /* bytes: 1, 2, 4, 8 */
     uint64_t  data;       /* write data */
     uint64_t  value;      /* the answer: read data or the import's result */
+    uint32_t  n_ret;      /* an import's answer: values (a struct's leaves; F6.4b2) */
+    uint64_t  values[ZBC_CALL_MAX_ARGS];   /* ... when n_ret > 1 (also [0] when 1) */
     void     *thread;
     const void *frame;    /* the frame whose IMPORT is answered */
+    uint32_t  executor;   /* F5.4a: the requesting frame's EXEC row (0xFFFFFFFF: none) */
     uint32_t  pc;         /* the IMPORT's global CODE index (REG side table) */
     int       wait_time;  /* the host waits on time (WAIT) */
     uint64_t  delay;      /* WAIT: ticks to the next timed batch */
@@ -166,6 +173,23 @@ typedef struct {
     int       on_event;   /* WAIT: on an event, not time */
     uint32_t  err_coro;   /* the first error's coroutine and pc */
     uint32_t  err_pc;
+    /* F3.8c: when the first error is an unsat procedural or action solve,
+     * its SOLVE record index and the pins it ran with (solver var, value),
+     * so the host can name the conflicting constraints; else 0xFFFFFFFF. */
+    uint32_t  err_solve;
+    uint32_t  err_npin;
+    uint32_t  err_pin_var[ZBC_CALL_MAX_ARGS + ZBC_SOLVE_MAX_INPUTS];
+    int64_t   err_pin_val[ZBC_CALL_MAX_ARGS + ZBC_SOLVE_MAX_INPUTS];
+    /* ... or an unsat activation cone: the activation's coroutine (else
+     * 0xFFFFFFFF), the cone, its constraints in force (err_nen of them),
+     * and the pins above (cone var index, value). */
+    uint32_t  err_act;
+    uint32_t  err_cone;
+    uint32_t  err_nen;
+    uint32_t  err_en[ZBC_CALL_MAX_ARGS + ZBC_SOLVE_MAX_INPUTS];
+    /* F6.11f: when error()/fatal() stopped the run, its text as pyvm's
+     * VMError has it ("error: <text>", "fatal (status N): <text>"); else "". */
+    char      err_text[256];
 } zbc_yield_t;
 
 /* Debugging (P4.5a; be-bc debug.py `Stub` is the reference). With
@@ -260,6 +284,8 @@ typedef struct {
 } zbc_dbg_frame_t;
 /* The live threads' ids, ascending; returns the count (fills up to cap). */
 uint32_t zbc_dbg_threads(const zbc_dbg_t *d, uint32_t *ids, uint32_t cap);
+/* The debug id of engine thread `thread` (0: not known; no debugger). */
+uint32_t zbc_dbg_thread_id(const zbc_dbg_t *d, const void *thread);
 /* Thread `thread_id`'s frames, innermost first; returns the count (0: no such thread). */
 uint32_t zbc_dbg_frames(const zbc_dbg_t *d, uint32_t thread_id, zbc_dbg_frame_t *out,
                         uint32_t cap);
@@ -297,6 +323,17 @@ typedef struct {
     /* Each frame's step budget: 0 is ZBC_STEP_LIMIT, ZBC_STEP_UNLIMITED
      * none (pssvm_load's `step_limit=N`). */
     uint64_t              step_limit;
+    /* 0 (the default): keyed child seeds (F3.9; when the image has SEEDKEY,
+     * else by position): a child forks from its parent's creation seed by
+     * (its seed key, how many siblings with that key came before), not by
+     * its position. 1: by position (pssvm_load's `seed_mode=stream`). */
+    uint32_t              seed_stream;
+    /* An exported action's arguments (F2.3b): in the run's root frame (its
+     * activation's node 0 and its plain SOLVEs), field pin_slot[i] is fixed
+     * to pin_val[i]. n_pins 0: none. */
+    const uint32_t       *pin_slot;
+    const int64_t        *pin_val;
+    uint32_t              n_pins;
 } zbc_host_t;
 
 /*
@@ -323,6 +360,11 @@ struct zbc_actrun_s;
 
 zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
                              int idx, va_list *args);
+
+/* Close every file PSS code opened (file_open, F6.11c). The table is the
+ * process's: a run's handles stay open for later calls of the same engine
+ * until this is called (end of zbc_run, pssvm_free). */
+void zbc_files_close_all(void);
 
 #ifdef __cplusplus
 }

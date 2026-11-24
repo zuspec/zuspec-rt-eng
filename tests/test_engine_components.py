@@ -174,3 +174,18 @@ def test_a_node_in_another_instance_needs_the_activity_table(eng):
     at = data.index(bytes(p))
     data = data[:at] + rec.to_bytes() + data[at + REC["zbc_comp"].size():]
     assert run_image(eng, data).status == ZBC_ERR_COMP_INIT
+
+
+def test_run_start_and_run_end_are_refused(eng):
+    """A tree with run_start/run_end blocks (ZBC_COMP_F_RUN_HOOKS: $run_start
+    and $run_end follow $comp_init) is refused until the engine runs them
+    around the entry (M1d F1.15), rather than its blocks skipped."""
+    data = _counter().to_bytes()
+    from zuspec.be.bc.format.reader import read_image
+    p = [s.payload for s in read_image(data).sections
+         if s.kind == spec.sec_kind("ZBC_SEC_COMP")][0]
+    rec = REC["zbc_comp"].from_bytes(p)
+    rec.flags |= spec.flag_value("zbc_comp_flags", "ZBC_COMP_F_RUN_HOOKS")
+    at = data.index(bytes(p))
+    data = data[:at] + rec.to_bytes() + data[at + REC["zbc_comp"].size():]
+    assert run_image(eng, data).status == ZBC_ERR_COMP_INIT

@@ -36,9 +36,14 @@ enum {
     ZBC_EV_NOTIFY    = 1u << 8,
     ZBC_EV_SANITIZER = 1u << 9,
     ZBC_EV_BRANCH    = 1u << 10,
-    ZBC_EV_RELOAD    = 1u << 11
+    ZBC_EV_RELOAD    = 1u << 11,
+    ZBC_EV_ACTION    = 1u << 12,
+    ZBC_EV_BENCH     = 1u << 13,
+    ZBC_EV_SOLVE     = 1u << 14,
+    ZBC_EV_COV       = 1u << 15
 };
-#define ZBC_EV_ALL 0xFFFu
+/* Every kind above: be-bc events.py EV_ALL (the simulator's default watch). */
+#define ZBC_EV_ALL 0xFFFFu
 #define ZBC_TRACE_SCHEMA_VERSION 2
 
 /* The bytes of the trace: called with the header, then once per record. */
@@ -88,6 +93,11 @@ void zbc_ev_delete(zbc_ev_sink_t *s);
  * get an empty header first. Returns 0, or -1 when out of memory. */
 int  zbc_ev_header(zbc_ev_sink_t *s, const char *const *keys,
                    const char *const *vals, uint32_t n);
+/* zbc_ev_header where a NULL vals[i] is the integer ints[i] instead
+ * (ints may be NULL when no vals[i] is). */
+int  zbc_ev_header_int(zbc_ev_sink_t *s, const char *const *keys,
+                       const char *const *vals, const uint64_t *ints,
+                       uint32_t n);
 /* Watch `mask` in coroutine `coro`, or in all of them (coro < 0; this also
  * resets the per-coroutine masks). mask 0 turns events off. */
 void zbc_ev_watch(zbc_ev_sink_t *s, uint32_t mask, int32_t coro);

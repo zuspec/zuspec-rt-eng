@@ -31,10 +31,13 @@ int zbc_run(const void *data, size_t size,
  * Pieces of zbc_run that the host ABI (pssvm_host.c) reuses.
  * zbc_image_check refuses an image the engine cannot run with `host` (no
  * COMP for a component tree, solve scopes, platform memory without
- * mem_access): ZBC_OK, or the error with *halted_op set for an opcode.
+ * mem_access, address claims): ZBC_OK, or the error with *halted_op set for an opcode.
  * zbc_drain runs `tb` to quiescence, setting ZBC_ERR_DEADLOCK in `out` when
  * every thread spins and nothing timed is left.
  */
+/* *halted_op for an image whose activation nodes claim addresses (no
+ * opcode names it; the C engine has no address ledger until M14). */
+#define ZBC_HALT_ADDR_CLAIM 0x10000
 int  zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_op);
 void zbc_drain(zsp_timebase_t *tb, zbc_image_t *img, zbc_result_t *out);
 /* zbc_drain that stops (returning 1) when `y` holds a pending request, or a

@@ -351,7 +351,10 @@ def test_pssvm_answers_raise_access_and_import_events(_rawlib):
                                      ctypes.c_char_p, sz, ctypes.c_uint64]
     lib.pssvm_call_start.restype = vp
     lib.pssvm_run.argtypes = [vp]
-    lib.pssvm_complete.argtypes = [vp, ctypes.c_char_p, sz]
+    from test_pssvm_host import PssvmReq
+    lib.pssvm_take.argtypes = [vp]
+    lib.pssvm_take.restype = ctypes.POINTER(PssvmReq)
+    lib.pssvm_complete.argtypes = [vp, ctypes.c_uint32, ctypes.c_char_p, sz]
     lib.pssvm_call_end.argtypes = [vp]
     lib.pssvm_free.argtypes = [vp]
     m = _mem_model(regs=[(2, 3), (3, 3)])
@@ -375,12 +378,19 @@ def test_pssvm_answers_raise_access_and_import_events(_rawlib):
         lib.pssvm_set_events(e, sink)
         h = lib.pssvm_call_start(e, b"", b"", None, 0, 0)
         # write, read32, read8, imp7: an answer is its request's size
-        for a in [None, (0xAB, 4), (0xAB, 1), (0x55, 8)]:
-            assert lib.pssvm_run(h) in (1, 2)       # PSSVM_ACCESS / PSSVM_IMPORT
+        MEM, USER = 0, 16                           # PSSVM_API_MEM / PSSVM_API_USER
+        for api, a in [(MEM, None), (MEM, (0xAB, 4)), (MEM, (0xAB, 1)), (USER, (0x55, 8))]:
+            assert lib.pssvm_run(h) == 1            # PSSVM_REQS
+            q = lib.pssvm_take(h)
+            assert q
+            q = q.contents
+            assert q.api == api
+            if api == USER:
+                assert q.fn == 7
             if a is None:
-                assert lib.pssvm_complete(h, None, 0) == 0
+                assert lib.pssvm_complete(h, q.req_id, None, 0) == 0
             else:
-                assert lib.pssvm_complete(h, a[0].to_bytes(a[1], "little"), a[1]) == 0
+                assert lib.pssvm_complete(h, q.req_id, a[0].to_bytes(a[1], "little"), a[1]) == 0
         lib.pssvm_error.argtypes = [vp, vp]
         lib.pssvm_error.restype = ctypes.c_char_p
         assert lib.pssvm_run(h) == 0, lib.pssvm_error(e, h)

@@ -117,6 +117,7 @@ typedef struct {
     const zbc_impent  *imports;
     uint32_t           import_count;
     const zbc_ident   *ident;
+    uint32_t           ident_size;   /* bytes of IDENT (16: no time_exp) */
     /* Optional debug side tables (P4.4a; NULL/0 if absent): register
      * accesses (REG) and channel operations (CHAN), each sorted by global
      * pc. zbc_image_open has checked the order, pcs and StrIds. */
@@ -124,6 +125,14 @@ typedef struct {
     uint32_t           reg_count;
     const zbc_chanent *chans;
     uint32_t           chan_count;
+    /* Optional executors (EXEC, F5.4a; NULL/0 if absent): row i is the
+     * executor id requests carry. zbc_image_open has checked the StrIds. */
+    const zbc_execent *execs;
+    uint32_t           exec_count;
+    /* Optional host-fed channels (EVENT, F5.5a; NULL/0 if absent): row i is
+     * the id notify(N_CHAN) names. zbc_image_open has checked the StrIds. */
+    const zbc_evtent  *events;
+    uint32_t           event_count;
     /* Optional coverage items (COV, P4.7; NULL/0 if absent): statements and
      * branch arms, sorted by global pc (a statement and an arm may share
      * one). zbc_image_open has checked the order, pcs and StrIds. */
@@ -146,6 +155,9 @@ typedef struct {
      * checked the coro order, coros, pcs and name StrIds. */
     const zbc_localent *locals;
     uint32_t           local_count;
+    /* Optional per-coroutine seed keys (SEEDKEY, F3.9; NULL if absent):
+     * seed_keys[coro], coro_count of them, for keyed child seeds. */
+    const uint64_t    *seed_keys;
     /* Optional activity table (ACT, P4.10c2; acttab NULL if absent): the
      * records in the order zbc_acttab lists them, the u32 lists, the string
      * offsets and text (ACT's own strings, not STRB) and the blob area.

@@ -66,7 +66,7 @@ class ZbcResult(ctypes.Structure):
 
 
 #: Must match ZBC_IMPORT_MAX_ARGS in zbc_interp.h.
-IMPORT_MAX_ARGS = 4
+IMPORT_MAX_ARGS = 16
 
 
 class ZbcImportCall(ctypes.Structure):
@@ -109,6 +109,10 @@ class ZbcHost(ctypes.Structure):
         ("bound", ctypes.c_void_p),        # uint8_t* per coroutine: NULL = none bound
         ("cbase", ctypes.c_uint32),        # component instance base (0: the root)
         ("step_limit", ctypes.c_uint64),   # per-frame step budget: 0 = ZBC_STEP_LIMIT
+        ("seed_stream", ctypes.c_uint32),  # 1: child seeds by position (0: keyed, F3.9)
+        ("pin_slot", ctypes.c_void_p),     # exported-action argument pins (F2.3b)
+        ("pin_val", ctypes.c_void_p),
+        ("n_pins", ctypes.c_uint32),
     ]
 
 

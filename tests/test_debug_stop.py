@@ -181,12 +181,16 @@ def test_a_breakpoint_on_a_blocking_import_stops_once(_rawlib):
         seen = []
         while True:
             r = call.run()
-            seen.append(r.status_name)
             if r.status == nhost.DONE:
+                seen.append(r.status_name)
                 break
-            if r.status == nhost.IMPORT:
-                call.complete(r.args[0] + 1000)
-    assert seen == ["STOP", "IMPORT", "STOP", "WAIT", "DONE"]
+            if r.status == nhost.REQS:
+                q = call.take()
+                seen.append((r.status_name, q.api, q.fn))
+                call.complete(q.req_id, q.args[0] + 1000)
+            else:
+                seen.append(r.status_name)
+    assert seen == ["STOP", ("REQS", nhost.API_USER, 42), "STOP", "WAIT", "DONE"]
     assert call.result == 1005
 
 
@@ -271,8 +275,10 @@ def _run_bus(call):
             stops.append(call.dbg_stop())
             call.dbg_resume()
         else:
-            assert r.status == nhost.ACCESS, r
-            call.complete(None if r.kind == "w" else 0xFEEDF00D)
+            assert r.status == nhost.REQS, r
+            q = call.take()
+            assert q.api == nhost.API_MEM, q
+            call.complete(q.req_id, None if q.kind == "w" else 0xFEEDF00D)
 
 
 def test_a_watched_write_stops_after_the_access(_rawlib):

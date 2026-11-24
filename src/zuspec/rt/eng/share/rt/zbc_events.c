@@ -126,6 +126,12 @@ void zbc_ev_delete(zbc_ev_sink_t *s) {
 
 int zbc_ev_header(zbc_ev_sink_t *s, const char *const *keys,
                   const char *const *vals, uint32_t n) {
+    return zbc_ev_header_int(s, keys, vals, NULL, n);
+}
+
+int zbc_ev_header_int(zbc_ev_sink_t *s, const char *const *keys,
+                      const char *const *vals, const uint64_t *ints,
+                      uint32_t n) {
     if (s->started) return 0;
     s->started = 1;
     zbc_ev_buf_t *b = &s->frame;
@@ -146,7 +152,12 @@ int zbc_ev_header(zbc_ev_sink_t *s, const char *const *keys,
         }
         done[k] = (uint32_t)best;
         put_str(s, b, keys[best], strlen(keys[best]));
-        put_str(s, b, vals[best], strlen(vals[best]));
+        if (vals[best] != NULL) {
+            put_str(s, b, vals[best], strlen(vals[best]));
+        } else {    /* zigzag, as binary.py: n >= 0 -> 2n */
+            buf_byte(b, T_INT);
+            buf_uvarint128(b, (unsigned __int128)ints[best] * 2);
+        }
     }
     if (b->oom || s->rec.oom) return -1;
     if (s->out) s->out(s->ctx, b->p, b->len);

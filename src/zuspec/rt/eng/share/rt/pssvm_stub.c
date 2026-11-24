@@ -26,7 +26,7 @@ enum { S_DETACHED, S_STARTING, S_STOPPED, S_RUNNING, S_EXITED };
 static const char *const STATE_NAMES[] = {"detached", "starting", "stopped", "running", "exited"};
 static const char *const STEP_NAMES[] = {"stmt", "stmt", "into", "out"};
 static const char *const REASONS[] = {"?", "pause", "step", "breakpoint", "watch", "error"};
-static const char *const KINDS[] = {"int", "bool", "enum", "string", "chandle", "opaque"};
+static const char *const KINDS[] = {"int", "bool", "enum", "string", "chandle", "opaque", "float"};
 static const char *const TSTATES[] = {"running", "ready", "waiting"};
 #define ATTACH_TIMEOUT_MS 10000
 
@@ -263,7 +263,7 @@ static int cmd_read_frame(pssvm_stub_t *s, rq_t *r, jv *a) {
         sb_str(&r->body, zbc_image_str(img, v->name));
         sb_f(&r->body, ",\"value\":%llu,\"width\":%u,\"signed\":%s,\"kind\":",
              (unsigned long long)f.locals[v->slot], v->width, (v->flags & 1) ? "true" : "false");
-        sb_str(&r->body, v->kind < 6 ? KINDS[v->kind] : "opaque");
+        sb_str(&r->body, v->kind < 7 ? KINDS[v->kind] : "opaque");
         sb_f(&r->body, "}");
         first = 0;
     }

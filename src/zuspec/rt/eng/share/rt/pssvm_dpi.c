@@ -18,6 +18,7 @@
  */
 #include "pssvm.h"
 #include "pssvm_json.h"
+#include "zbc_events.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -34,6 +35,30 @@ static char     g_str[64];
 static char     g_line[512];
 
 static void remember_image(pssvm_t *e, const char *path);
+
+/* The queue pssvm_dpi_msg_next drains: entries "<sev digit><text>\0". */
+static zbc_host_t g_msg_host;
+static char      *g_msg_buf;
+static uint32_t   g_msg_len, g_msg_head, g_msg_cap;
+static int        g_msg_sev;
+
+static void msg_put(void *ctx, uint32_t severity, uint64_t level, const char *txt,
+                    uint32_t len) {
+    (void)ctx;
+    (void)level;
+    if (g_msg_len + len + 2 > g_msg_cap) {
+        uint32_t cap = g_msg_cap ? g_msg_cap : 4096;
+        while (g_msg_len + len + 2 > cap) cap *= 2;
+        char *b = (char *)realloc(g_msg_buf, cap);
+        if (b == NULL) return;
+        g_msg_buf = b;
+        g_msg_cap = cap;
+    }
+    g_msg_buf[g_msg_len++] = (char)('0' + (severity > 9 ? 9 : severity));
+    memcpy(g_msg_buf + g_msg_len, txt, len);
+    g_msg_len += len;
+    g_msg_buf[g_msg_len++] = 0;
+}
 
 static void dpi_err(const char *fmt, ...) {
     va_list ap;
@@ -66,6 +91,43 @@ static uint8_t *read_image(const char *path, long *len) {
     return buf;
 }
 
+/* opts `trace=<file>` (up to the next ','): write every debug event of the
+ * engine's runs to <file> as a binary trace (be-bc trace/binary.py), header
+ * keys `image` = the image path and `seed` = the calls' seed; `trace_mask=N` narrows the events (default
+ * all). The file and sink live until the process ends (stdio flushes the
+ * file at exit). */
+static void ev_fwrite(void *ctx, const uint8_t *p, size_t n) {
+    fwrite(p, 1, n, (FILE *)ctx);
+}
+
+static void trace_to(pssvm_t *e, const char *opts, const char *image) {
+    const char *t = opts ? strstr(opts, "trace=") : NULL;
+    if (t == NULL || (t > opts && t[-1] != ',')) return;    /* not trace_mask= */
+    t += 6;
+    char path[1024];
+    size_t n = strcspn(t, ",");
+    if (n == 0 || n >= sizeof(path)) return;
+    memcpy(path, t, n);
+    path[n] = 0;
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) {
+        fprintf(stderr, "PSSVM-ERROR: trace %s: %s\n", path, strerror(errno));
+        return;
+    }
+    zbc_ev_sink_t *s = zbc_ev_new(ev_fwrite, fp);
+    if (s == NULL) {
+        fclose(fp);
+        return;
+    }
+    const char *m = strstr(opts, "trace_mask=");
+    zbc_ev_watch(s, m ? (uint32_t)strtoul(m + 11, NULL, 0) : ZBC_EV_ALL, -1);
+    const char *k[2] = {"image", "seed"};
+    const char *v[2] = {image, NULL};
+    uint64_t    iv[2] = {0, g_seed};
+    zbc_ev_header_int(s, k, v, iv, 2);
+    pssvm_set_events(e, s);
+}
+
 void *pssvm_dpi_load(const char *path, const char *opts) {
     g_dpi_err[0] = 0;
     long n = 0;
@@ -80,9 +142,31 @@ void *pssvm_dpi_load(const char *path, const char *opts) {
     }
     const char *s = opts ? strstr(opts, "seed=") : NULL;
     g_seed = s ? strtoull(s + 5, NULL, 0) : 0;
+    const char *v = opts ? strstr(opts, "verbosity=") : NULL;
+    g_msg_host.message   = msg_put;
+    g_msg_host.verbosity = v ? (uint32_t)strtoul(v + 10, NULL, 10) : 0;
+    pssvm_set_host(e, &g_msg_host);
+    trace_to(e, opts, path);
     remember_image(e, path);
     return e;
 }
+
+/* message()/error()/fatal() text the runs produced, oldest first; "" when
+ * none is left. The severity (ZBC_MSG_SEV_*) of the last one returned is
+ * pssvm_dpi_msg_sev. One queue for every engine loaded here (as g_seed). */
+const char *pssvm_dpi_msg_next(void *e) {
+    (void)e;
+    if (g_msg_head == g_msg_len) {
+        g_msg_head = g_msg_len = 0;
+        return "";
+    }
+    const char *m = g_msg_buf + g_msg_head;
+    g_msg_sev = (uint8_t)*m - '0';
+    g_msg_head += (uint32_t)strlen(m) + 1;
+    return m + 1;
+}
+
+int pssvm_dpi_msg_sev(void *e) { (void)e; return g_msg_sev; }
 
 /* Build the component tree; again (a clean model) when one is built. */
 int pssvm_dpi_construct(void *e, const char *root_type) {
@@ -114,23 +198,70 @@ void *pssvm_dpi_call_start(void *e, const char *entry, const char *comp_path) {
     return pssvm_call_start((pssvm_t *)e, entry, comp_path, a, 8u * n, g_seed);
 }
 
-int pssvm_dpi_req_int(void *h, const char *field) {
-    const pssvm_req_t *r = pssvm_request((pssvm_call_t *)h);
+/* Requests SV took (pssvm_dpi_take), by call and req_id, until completed.
+ * An entry a later take of the same (call, req_id) finds is stale (its call
+ * ended) and is reused. */
+#define DPI_TAKEN_MAX 256
+#define DPI_RET_MAX   32    /* a struct result's fields: ZBC_CALL_MAX_ARGS */
+static struct {
+    void *h; int rid; const pssvm_req_t *r;
+    uint64_t ret[DPI_RET_MAX];      /* a struct result, staged by set_ret */
+    int      n_set;                 /* fields staged (highest index + 1) */
+} g_taken[DPI_TAKEN_MAX];
+
+static int taken_slot(void *h, int rid) {
+    for (int i = 0; i < DPI_TAKEN_MAX; i++)
+        if (g_taken[i].r && g_taken[i].h == h && g_taken[i].rid == rid) return i;
+    return -1;
+}
+
+/* rid -1: what the run status says (WAIT's on and delay, STOP's src_ref). */
+static const pssvm_req_t *dpi_req(void *h, int rid) {
+    if (rid < 0) return pssvm_request((pssvm_call_t *)h);
+    int i = taken_slot(h, rid);
+    return i < 0 ? NULL : g_taken[i].r;
+}
+
+/* The next new request (after PSSVM_REQS): its req_id, -1 when none. */
+int pssvm_dpi_take(void *h) {
+    const pssvm_req_t *r = pssvm_take((pssvm_call_t *)h);
+    if (r == NULL) return -1;
+    int i = taken_slot(h, (int)r->req_id);
+    for (int j = 0; i < 0 && j < DPI_TAKEN_MAX; j++)
+        if (g_taken[j].r == NULL) i = j;
+    if (i < 0) i = 0;
+    g_taken[i].h = h;
+    g_taken[i].rid = (int)r->req_id;
+    g_taken[i].r = r;
+    memset(g_taken[i].ret, 0, sizeof(g_taken[i].ret));
+    g_taken[i].n_set = 0;
+    return (int)r->req_id;
+}
+
+int pssvm_dpi_req_int(void *h, int rid, const char *field) {
+    const pssvm_req_t *r = dpi_req(h, rid);
     if (r == NULL || field == NULL) return 0;
     if (!strcmp(field, "status"))   return r->status;
+    if (!strcmp(field, "req_id"))   return (int)r->req_id;
+    if (!strcmp(field, "api"))      return (int)r->api;
+    if (!strcmp(field, "thread"))   return (int)r->thread;
+    if (!strcmp(field, "executor")) return (int)r->executor;   /* none: -1 */
     if (!strcmp(field, "kind"))     return (int)r->kind;
     if (!strcmp(field, "size"))     return (int)r->size;
     if (!strcmp(field, "reg_id"))   return (int)r->reg_id;
-    if (!strcmp(field, "fn_id"))    return (int)r->fn_id;
+    if (!strcmp(field, "fn_id") || !strcmp(field, "fn")) return (int)r->fn;
     if (!strcmp(field, "blocking")) return (int)r->blocking;
     if (!strcmp(field, "has_ret"))  return (int)r->has_ret;
-    if (!strcmp(field, "on"))       return (int)r->on;
+    if (!strcmp(field, "nret"))     return r->nret > 1 ? (int)r->nret : 0;
+    /* SV's pssvm_wait_on_e: TIME 0, EVENT 1, REQS 2 */
+    if (!strcmp(field, "on"))
+        return r->on == PSSVM_ON_EVENT ? 1 : r->on == PSSVM_ON_REQS ? 2 : 0;
     if (!strcmp(field, "bound"))    return (int)r->bound;
     return 0;
 }
 
-uint64_t pssvm_dpi_req_u64(void *h, const char *field) {
-    const pssvm_req_t *r = pssvm_request((pssvm_call_t *)h);
+uint64_t pssvm_dpi_req_u64(void *h, int rid, const char *field) {
+    const pssvm_req_t *r = dpi_req(h, rid);
     if (r == NULL || field == NULL) return 0;
     if (!strcmp(field, "addr"))  return r->addr;
     if (!strcmp(field, "data"))  return r->data;
@@ -141,8 +272,8 @@ uint64_t pssvm_dpi_req_u64(void *h, const char *field) {
 /* name (an import's; "" when the image has none), src_ref (its index, ""
  * when unknown), reason ("": the engine gives none). Valid until the next
  * call. */
-const char *pssvm_dpi_req_str(void *h, const char *field) {
-    const pssvm_req_t *r = pssvm_request((pssvm_call_t *)h);
+const char *pssvm_dpi_req_str(void *h, int rid, const char *field) {
+    const pssvm_req_t *r = dpi_req(h, rid);
     g_str[0] = 0;
     if (r == NULL || field == NULL) return g_str;
     if (!strcmp(field, "name") && r->name) return r->name;
@@ -151,30 +282,54 @@ const char *pssvm_dpi_req_str(void *h, const char *field) {
     return g_str;
 }
 
-int pssvm_dpi_req_nargs(void *h) {
-    const pssvm_req_t *r = pssvm_request((pssvm_call_t *)h);
+int pssvm_dpi_req_nargs(void *h, int rid) {
+    const pssvm_req_t *r = dpi_req(h, rid);
     return r ? (int)(r->args_len / 8) : 0;
 }
 
-uint64_t pssvm_dpi_req_arg(void *h, int i) {
-    const pssvm_req_t *r = pssvm_request((pssvm_call_t *)h);
+uint64_t pssvm_dpi_req_arg(void *h, int rid, int i) {
+    const pssvm_req_t *r = dpi_req(h, rid);
     if (r == NULL || i < 0 || (size_t)i >= r->args_len / 8) return 0;
     uint64_t v = 0;
     for (int b = 7; b >= 0; b--) v = (v << 8) | r->args[8 * i + b];
     return v;
 }
 
-/* Answer the pending request: a read's data or an import's result; `data`
- * is ignored where the request wants no answer (a write, a void import). */
-int pssvm_dpi_complete(void *h, uint64_t data) {
-    const pssvm_req_t *r = pssvm_request((pssvm_call_t *)h);
-    uint8_t b[8];
+/* Stage field `i` of taken request `rid`'s struct result ("nret" fields;
+ * a one-field struct may answer through `data` instead);
+ * pssvm_dpi_complete then answers with the staged fields (no open array:
+ * Verilator 5.052 cannot compile one in an import). */
+int pssvm_dpi_set_ret(void *h, int rid, int i, uint64_t v) {
+    int k = taken_slot(h, rid);
+    if (k < 0 || i < 0 || i >= DPI_RET_MAX) return PSSVM_E_ARGS;
+    g_taken[k].ret[i] = v;
+    if (i >= g_taken[k].n_set) g_taken[k].n_set = i + 1;
+    return 0;
+}
+
+/* Answer taken request `rid`: a read's data or an import's result; `data`
+ * is ignored where the request wants no answer (a write, a void import)
+ * and for a struct result, whose fields pssvm_dpi_set_ret staged. */
+int pssvm_dpi_complete(void *h, int rid, uint64_t data) {
+    int i = taken_slot(h, rid);
+    if (i < 0) return PSSVM_E_STATE;
+    const pssvm_req_t *r = g_taken[i].r;
+    uint8_t b[8 * DPI_RET_MAX];
     size_t len = 8;
-    if (r != NULL && ((r->status == PSSVM_ACCESS && r->kind == 1)
-                      || (r->status == PSSVM_IMPORT && !r->has_ret)))
+    if ((r->api == PSSVM_API_MEM && r->kind == 1)
+            || (r->api != PSSVM_API_MEM && !r->has_ret))
         len = 0;
-    for (int i = 0; i < 8; i++) b[i] = (uint8_t)(data >> (8 * i));
-    return pssvm_complete((pssvm_call_t *)h, b, len);
+    if (len && r->api != PSSVM_API_MEM && (r->nret > 1 || g_taken[i].n_set)) {
+        uint32_t n = r->nret < DPI_RET_MAX ? r->nret : DPI_RET_MAX;
+        for (uint32_t f = 0; f < n; f++)
+            for (int k = 0; k < 8; k++)
+                b[8 * f + k] = (uint8_t)(g_taken[i].ret[f] >> (8 * k));
+        len = 8u * (r->nret ? r->nret : 1u);
+    } else {
+        for (int k = 0; k < 8; k++) b[k] = (uint8_t)(data >> (8 * k));
+    }
+    g_taken[i].r = NULL;
+    return pssvm_complete((pssvm_call_t *)h, (uint32_t)rid, b, len);
 }
 
 uint64_t pssvm_dpi_result(void *h) {
@@ -182,6 +337,14 @@ uint64_t pssvm_dpi_result(void *h) {
     uint64_t v = 0;
     pssvm_result((pssvm_call_t *)h, b, sizeof(b));
     for (int i = 7; i >= 0; i--) v = (v << 8) | b[i];
+    return v;
+}
+
+/* F5.6: field `name` of call `h`'s action object after DONE (pssvm_call_field);
+ * 0 and the call's error set if it has none. */
+uint64_t pssvm_dpi_obj_field(void *h, const char *name) {
+    uint64_t v = 0;
+    pssvm_call_field((pssvm_call_t *)h, name, &v);
     return v;
 }
 
@@ -236,6 +399,32 @@ const char *pssvm_dpi_test_name(void *e, int i) { return native_field(e, "test",
 const char *pssvm_dpi_test_expect(void *e, int i) { return native_field(e, "test", i, 2); }
 
 /* Session, setup or teardown function `i` (`kind`); "" past the last. */
+/* F5.4a: executor id <-> path (pssvm_exec_id/_path); -1 / "": none. */
+int pssvm_dpi_exec_id(void *e, const char *path) {
+    return pssvm_exec_id((pssvm_t *)e, path);
+}
+
+/* F5.5a: host-fed channel id (pssvm_event_id); -1: none. */
+int pssvm_dpi_event_id(void *e, const char *path) {
+    return pssvm_event_id((pssvm_t *)e, path);
+}
+
+/* F5.7: one tick is 10^time_exp s (pssvm_time_exp). */
+int pssvm_dpi_time_exp(void *e) {
+    return pssvm_time_exp((pssvm_t *)e);
+}
+
+const char *pssvm_dpi_exec_path(void *e, int id) {
+    const char *p = id < 0 ? NULL : pssvm_exec_path((pssvm_t *)e, (uint32_t)id);
+    return p ? p : "";
+}
+
+/* F6.3a: the text of model string `idx` (an import's string argument), "" out of range. */
+const char *pssvm_dpi_string(void *e, int idx) {
+    const char *p = idx < 0 ? NULL : pssvm_string((pssvm_t *)e, (uint32_t)idx);
+    return p ? p : "";
+}
+
 const char *pssvm_dpi_hook(void *e, const char *kind, int i) {
     return native_field(e, kind, i, 1);
 }

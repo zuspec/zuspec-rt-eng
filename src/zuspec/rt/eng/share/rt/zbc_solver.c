@@ -67,8 +67,16 @@ ZBC_DVS extern int     dvs_solver_pin_var(void *ctx, uint32_t var_id, int64_t va
 int zbc_solver_run(const void *problem_blob, uint64_t seed,
                    const uint32_t *pairs, uint32_t n_pairs,
                    uint64_t *slots) {
+    return zbc_solver_run_pinned(problem_blob, seed, pairs, n_pairs, slots,
+                                 (const uint32_t *)0, (const int64_t *)0, 0);
+}
+
+int zbc_solver_run_pinned(const void *problem_blob, uint64_t seed,
+                          const uint32_t *pairs, uint32_t n_pairs, uint64_t *slots,
+                          const uint32_t *pin_var, const int64_t *pin_val,
+                          uint32_t n_pins) {
     int rc = ZBC_SOLVER_FAIL;
-    if (!dvs_solver_create) {
+    if (!dvs_solver_create || (n_pins && !dvs_solver_pin_var)) {
         return ZBC_SOLVER_FAIL;   /* libdv_solve not linked */
     }
     void *ctx_buf = malloc(ZBC_SOLVER_CTX_SIZE);
@@ -98,6 +106,13 @@ int zbc_solver_run(const void *problem_blob, uint64_t seed,
     if (crc != 0) {
         rc = ZBC_SOLVER_FAIL;
         goto done;
+    }
+    if (n_pins) (void)dvs_solver_checkpoint(ctx);     /* as zbc_solver_cone */
+    for (uint32_t i = 0; i < n_pins; i++) {
+        if (dvs_solver_pin_var(ctx, pin_var[i], pin_val[i]) != 0) {
+            rc = ZBC_SOLVER_UNSAT;
+            goto done;
+        }
     }
 
     zbc_dv_solve_opts_t opts = {0};

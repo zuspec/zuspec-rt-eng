@@ -74,7 +74,7 @@ int zbc_drain_until(zsp_timebase_t *tb, zbc_image_t *img, zbc_result_t *out,
 /* The cone solves of img's activations need nothing the C engine lacks
  * (P4.10d1; an instance choice, comp_slot, since d2; state pools since d3):
  * buffer picks since d4; resource claims since e1 (parallel footprints since
- * e2), but no resource pool over 64 instances (busy masks are 64-bit); no
+ * e2), but no resource pool over 63 instances (one busy mask word, BUSY_WORD_BITS); no
  * pools but state,
  * buffer and resource ones (a loop index read by a `with` since f3). */
 static int act_solve_supported(const zbc_image_t *img) {
@@ -86,11 +86,61 @@ static int act_solve_supported(const zbc_image_t *img) {
         for (uint32_t p = 0; p < r->n_pools; p++) {
             const zbc_actpool *pl = &img->actpools[r->pool0 + p];
             const char *k = zbc_image_act_str(img, pl->kind);
-            if (k && !strcmp(k, "resource") && pl->size <= 64) continue;
+            if (k && !strcmp(k, "resource") && pl->size <= 63) continue;
             if (!k || (strcmp(k, "state") && strcmp(k, "buffer"))) return 0;
         }
     }
     return 1;
+}
+
+/* A cone of img's activations reads a list (actvar flag 8, F6.10d): its
+ * elements are heap values, so it is refused with the heap. */
+static int act_reads_list(const zbc_image_t *img) {
+    const zbc_acttab *t = img->acttab;
+    if (!t) return 0;
+    for (uint32_t i = 0; i < t->n_vars; i++)
+        if (img->actvars[i].flags & 8u) return 1;
+    return 0;
+}
+
+/* A node of img's activations claims addresses (actnode addr0, F7.3d): the
+ * run's ledger keeps live and permanent claims apart and places contiguous
+ * ones first-fit, and the C engine has neither yet (M14), so it is refused
+ * rather than run with claims that may overlap. */
+static int act_claims_addrs(const zbc_image_t *img) {
+    const zbc_acttab *t = img->acttab;
+    if (!t) return 0;
+    for (uint32_t i = 0; i < t->n_nodes; i++) {
+        uint32_t a = img->actnodes[i].addr0;
+        if (a && a < t->n_u32 && img->actlist[a]) return 1;
+    }
+    return 0;
+}
+
+/* An opcode the interpreter has a case for (zbc_interp.c). PAR has none: no
+ * lowering emits it, and the Python engine rejects it too. */
+static int op_known(uint32_t op) {
+    switch (op) {
+    case ZBC_OP_NOP: case ZBC_OP_RET:
+    case ZBC_OP_CONST: case ZBC_OP_MOV: case ZBC_OP_LD_LOCAL: case ZBC_OP_ST_LOCAL:
+    case ZBC_OP_LD_FIELD: case ZBC_OP_ST_FIELD: case ZBC_OP_LD_COMP: case ZBC_OP_ST_COMP:
+    case ZBC_OP_ARG: case ZBC_OP_LD_ARG: case ZBC_OP_LD_RES:
+    case ZBC_OP_ADD: case ZBC_OP_SUB: case ZBC_OP_MUL: case ZBC_OP_DIV: case ZBC_OP_MOD:
+    case ZBC_OP_AND: case ZBC_OP_OR: case ZBC_OP_XOR: case ZBC_OP_SHL: case ZBC_OP_SHR:
+    case ZBC_OP_NEG: case ZBC_OP_NOT:
+    case ZBC_OP_FARITH: case ZBC_OP_FCVT: case ZBC_OP_FCMP: case ZBC_OP_FMATH:
+    case ZBC_OP_CMP_EQ: case ZBC_OP_CMP_NE: case ZBC_OP_CMP_LT: case ZBC_OP_CMP_LE:
+    case ZBC_OP_CMP_GT: case ZBC_OP_CMP_GE:
+    case ZBC_OP_BR: case ZBC_OP_BRZ:
+    case ZBC_OP_SPAWN: case ZBC_OP_INVOKE: case ZBC_OP_JOIN: case ZBC_OP_WAIT:
+    case ZBC_OP_SELECT: case ZBC_OP_SOLVE: case ZBC_OP_BIND: case ZBC_OP_YIELD:
+    case ZBC_OP_IMPORT: case ZBC_OP_SCOPE_ENTER: case ZBC_OP_SOLVE_NODE: case ZBC_OP_CALL:
+    case ZBC_OP_SOLVE_PIN: case ZBC_OP_SOLVE_GET: case ZBC_OP_COV_SAMPLE:
+    case ZBC_OP_EXEC_SET: case ZBC_OP_EXEC_GET:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 int zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_op) {
@@ -99,8 +149,11 @@ int zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_
      * either, so the image is refused rather than its construction skipped
      * (P1-D6); so is one whose activation nodes run in an instance other than
      * instance 0 but that has no ACT section to say which (frames carry
-     * their instance from it, P4.10c4). */
+     * their instance from it, P4.10c4). The tree's run_start/run_end
+     * coroutines (ZBC_COMP_F_RUN_HOOKS) are not run here yet: refused rather
+     * than skipped. */
     if (((img->hdr->flags & ZBC_HDR_COMP_INIT) && img->comp == NULL)
+            || (img->comp && (img->comp->flags & ZBC_COMP_F_RUN_HOOKS))
             || (img->comp && (img->comp->flags & ZBC_COMP_F_NODE_INST) && !img->acttab)
             || (img->comp && img->comp->init_coro != 0xFFFFFFFFu
                 && img->comp->init_coro >= img->coro_count)) {
@@ -115,15 +168,30 @@ int zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_
      * constraints, initializers or component state would not hold (P1-D6). */
     for (uint32_t i = 0; i < img->code_count; i++) {
         uint32_t op = img->code[i].op;
-        if ((op == ZBC_OP_SOLVE_NODE && !act_solve_supported(img))
+        /* file_read* / file_write_lines make or read heap values: refused as the heap. */
+        int heap_file = (op == ZBC_OP_IMPORT && img->code[i].arg0 >= ZBC_BUILTIN_FILE_READ
+                && img->code[i].arg0 <= ZBC_BUILTIN_FILE_WRITE_LINES)
+                /* ... and so does a cone solve that reads a list. */
+                || (op == ZBC_OP_SOLVE_NODE && act_reads_list(img));
+        if (!op_known(op)
+                /* An opcode from a newer format, refused before any of it runs. */
+                /* Heap ops (heap.md s.9): the Python engine's alone until M14. */
+                || op == ZBC_OP_HEAP || heap_file
+                || (op == ZBC_OP_SOLVE_NODE && !act_solve_supported(img))
                 || ((op == ZBC_OP_LD_COMP || op == ZBC_OP_ST_COMP) && img->comp == NULL)
+                /* join_select / join_branch (F8 M8b1): the Python engine's alone until M14. */
+                || (op == ZBC_OP_JOIN && (img->code[i].flags & ZBC_F_SUBSET))
                 /* Platform memory (B-D6): only a host with mem_access answers it. */
                 || (op == ZBC_OP_IMPORT && (host == NULL || (host->mem_access == NULL && host->yield == NULL))
                     && img->code[i].arg0 >= ZBC_BUILTIN_MEM_FIRST
                     && img->code[i].arg0 <= ZBC_BUILTIN_MEM_LAST)) {
-            *halted_op = (int)op;
+            *halted_op = heap_file ? ZBC_OP_HEAP : (int)op;
             return ZBC_ERR_UNSUPPORTED_OP;
         }
+    }
+    if (act_claims_addrs(img)) {
+        *halted_op = ZBC_HALT_ADDR_CLAIM;
+        return ZBC_ERR_UNSUPPORTED_OP;
     }
     return ZBC_OK;
 }
@@ -197,6 +265,7 @@ int zbc_run(const void *data, size_t size,
     zbc_drain(tb, &img, out);
 
     out->now = zsp_timebase_current_ticks(tb);
+    zbc_files_close_all();
 
     zsp_timebase_destroy(tb);
     free(img.cobj);

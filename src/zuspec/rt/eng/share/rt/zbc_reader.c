@@ -51,7 +51,7 @@ static int open_msg(zbc_image_t *img, const zbc_section *sec) {
     }
     for (uint32_t i = 0; i < t->n_args; i++) {
         const zbc_msgarg *a = &img->msgargs[i];
-        if (a->kind > ZBC_MSG_CHANDLE || (uint64_t)a->item0 + a->n_items > t->n_items)
+        if (a->kind > ZBC_MSG_FLOAT || (uint64_t)a->item0 + a->n_items > t->n_items)
             return ZBC_ERR_BAD_SECTIONS;
     }
     for (uint32_t i = 0; i < t->n_items; i++)
@@ -218,6 +218,8 @@ int zbc_image_open(zbc_image_t *img, const void *data, size_t size) {
     img->msgtab = NULL;  img->msgs = NULL;  img->msgargs = NULL;
     img->msgitems = NULL; img->msgslots = NULL; img->msgstr_off = NULL; img->msgstrb = NULL;
     img->regs = NULL;    img->reg_count = 0; img->chans = NULL; img->chan_count = 0;
+    img->execs = NULL;   img->exec_count = 0;
+    img->events = NULL;  img->event_count = 0;
     img->covs = NULL;    img->cov_count = 0;
     img->locals = NULL;  img->local_count = 0;
     img->spin_stuck = NULL;
@@ -387,10 +389,12 @@ int zbc_image_open(zbc_image_t *img, const void *data, size_t size) {
     /* Optional IDENT: one zbc_ident. */
     const zbc_section *id_sec = zbc_find_section(img, ZBC_SEC_IDENT);
     if (id_sec) {
-        if (id_sec->size < sizeof(zbc_ident) || !in_bounds(img, id_sec->offset, id_sec->size)) {
+        /* 16 bytes: an image from before time_exp (F5.7) */
+        if (id_sec->size < 16 || !in_bounds(img, id_sec->offset, id_sec->size)) {
             return ZBC_ERR_BAD_SECTIONS;
         }
         img->ident = (const zbc_ident *)(img->data + id_sec->offset);
+        img->ident_size = id_sec->size;
     }
 
     /* Optional REG and CHAN (debug side tables): sorted by pc, pcs in CODE,
@@ -408,6 +412,36 @@ int zbc_image_open(zbc_image_t *img, const void *data, size_t size) {
         }
         img->regs = r;
         img->reg_count = reg_sec->count;
+    }
+    const zbc_section *exec_sec = zbc_find_section(img, ZBC_SEC_EXEC);
+    if (exec_sec && exec_sec->size) {
+        if (img->strb == NULL || !in_bounds(img, exec_sec->offset, exec_sec->size)
+                || exec_sec->size < sizeof(zbc_exectab))
+            return ZBC_ERR_BAD_SECTIONS;
+        const zbc_exectab *t = (const zbc_exectab *)(img->data + exec_sec->offset);
+        if (exec_sec->size < sizeof(zbc_exectab) + (uint64_t)t->n_exec * sizeof(zbc_execent))
+            return ZBC_ERR_BAD_SECTIONS;
+        const zbc_execent *x = (const zbc_execent *)(t + 1);
+        for (uint32_t i = 0; i < t->n_exec; i++) {
+            if (x[i].path >= img->str_count || x[i].type >= img->str_count
+                    || x[i].trait >= img->str_count)
+                return ZBC_ERR_BAD_SECTIONS;
+        }
+        img->execs = x;
+        img->exec_count = t->n_exec;
+    }
+    const zbc_section *evt_sec = zbc_find_section(img, ZBC_SEC_EVENT);
+    if (evt_sec && evt_sec->count) {
+        if (img->strb == NULL || !in_bounds(img, evt_sec->offset, evt_sec->size)
+                || evt_sec->size < (uint64_t)evt_sec->count * sizeof(zbc_evtent))
+            return ZBC_ERR_BAD_SECTIONS;
+        const zbc_evtent *v = (const zbc_evtent *)(img->data + evt_sec->offset);
+        for (uint32_t i = 0; i < evt_sec->count; i++) {
+            if (v[i].path >= img->str_count)
+                return ZBC_ERR_BAD_SECTIONS;
+        }
+        img->events = v;
+        img->event_count = evt_sec->count;
     }
     const zbc_section *chan_sec = zbc_find_section(img, ZBC_SEC_CHAN);
     if (chan_sec && chan_sec->count) {
@@ -502,6 +536,14 @@ int zbc_image_open(zbc_image_t *img, const void *data, size_t size) {
         }
         img->provs = p;
         img->prov_count = prov_sec->count;
+    }
+    const zbc_section *sk_sec = zbc_find_section(img, ZBC_SEC_SEEDKEY);
+    if (sk_sec && sk_sec->count) {
+        if (sk_sec->count != img->coro_count || !in_bounds(img, sk_sec->offset, sk_sec->size)
+                || sk_sec->size < 8ull * sk_sec->count || (sk_sec->offset & 7u)) {
+            return ZBC_ERR_BAD_SECTIONS;
+        }
+        img->seed_keys = (const uint64_t *)(img->data + sk_sec->offset);
     }
     const zbc_section *act_sec = zbc_find_section(img, ZBC_SEC_ACT);
     if (act_sec) {

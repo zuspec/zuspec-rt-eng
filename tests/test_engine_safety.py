@@ -132,6 +132,43 @@ def test_unsupported_op_reports_the_opcode(eng):
     assert res.halted_op == int(Op.PAR)
 
 
+def _patched(code, index, op):
+    """The image of ``code`` with instruction ``index``'s opcode set to ``op``,
+    which the model itself would refuse to build (an opcode from a newer format)."""
+    from zuspec.be.bc.format import spec
+    image = ZbcModel(coros=[CoroDescriptor(name="main", code=code, blocks=[])],
+                     entry_coro=0).to_container()
+    sec = next(s for s in image.sections if s.kind == spec.sec_kind("ZBC_SEC_CODE"))
+    payload = bytearray(sec.payload)
+    payload[32 * index:32 * index + 2] = op.to_bytes(2, "little")   # zbc_instr.op (u16)
+    sec.payload = bytes(payload)
+    return image
+
+
+def test_unknown_opcode_is_refused_before_anything_runs(eng):
+    # The IMPORT before it never reaches the host: the image is checked first.
+    from zuspec.be.bc.format.writer import write_image
+    from conftest import make_import_host
+    imp = Instr(Op.IMPORT, args=(0, 0xFFFFFFFF))
+    image = _patched([imp, Instr(Op.NOP), Instr(Op.RET)], 1, 0xEE)
+    host, read_calls = make_import_host()
+    res = run_image(eng, write_image(image), host=host)
+    assert res.status == ZBC_ERR_UNSUPPORTED_OP
+    assert res.halted_op == 0xEE
+    assert list(read_calls()) == []
+
+
+def test_an_unknown_section_is_skipped(eng):
+    from zuspec.be.bc.format.writer import Section, write_image
+    code = [Instr(Op.CONST, args=(0,), imm=7), Instr(Op.RET, args=(0,))]
+    image = ZbcModel(coros=[CoroDescriptor(name="main", code=code, blocks=[])],
+                     entry_coro=0).to_container()
+    image.sections.append(Section(kind=0x7F00, payload=b"from a newer format"))
+    res = run_image(eng, write_image(image))
+    assert res.status == 0
+    assert res.retval == 7
+
+
 def test_field_access_without_object_is_rejected(eng):
     # LD_FIELD but no object was provided -> NO_OBJ.
     res = _run(eng, [Instr(Op.LD_FIELD, args=(0, 0)), Instr(Op.RET, args=(0,))])

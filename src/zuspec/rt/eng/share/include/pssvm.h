@@ -5,9 +5,12 @@
  * (pssvm_construct), then starts calls by entry name (pssvm_call_start) and
  * runs each to a status (pssvm_run).
  *
- * P4.3b (this version): pssvm_run runs a call to DONE or ERROR, or stops at
- * a bus access (ACCESS) or an import (IMPORT); pssvm_request shows it and
- * pssvm_complete answers it, and the next pssvm_run goes on from there.
+ * ABI 2 (F5.2b): pssvm_run runs a call to DONE or ERROR, or returns REQS
+ * when a thread made a request of an API (mem: a register or memory access;
+ * user: an import); pssvm_take gives it (once) and pssvm_complete(req_id)
+ * answers it, and the next pssvm_run goes on from there. The C engine keeps
+ * one request outstanding (several at once: M14); a run with it unanswered
+ * returns WAIT on REQS. pssvm_request shows a WAIT's `on`/`delay` and a STOP.
  * message / error / fatal do not yield.
  * P4.3c: when no thread of a call is ready and one waits on time, pssvm_run
  * returns WAIT (on TIME, `delay` ticks); the host waits, then pssvm_run goes
@@ -33,13 +36,12 @@
 extern "C" {
 #endif
 
-#define PSSVM_ABI_VERSION 1
+#define PSSVM_ABI_VERSION 2
 
 /* pssvm_run status */
 enum {
     PSSVM_DONE   =  0,
-    PSSVM_ACCESS =  1,
-    PSSVM_IMPORT =  2,
+    PSSVM_REQS   =  1,   /* 2, the old IMPORT, is unused */
     PSSVM_WAIT   =  3,
     PSSVM_STOP   =  4,
     PSSVM_ERROR  = -1
@@ -55,23 +57,31 @@ enum {
 };
 
 /* pssvm_req_t.on, for WAIT */
-enum { PSSVM_ON_TIME = 1, PSSVM_ON_EVENT = 2 };
+enum { PSSVM_ON_TIME = 1, PSSVM_ON_EVENT = 2, PSSVM_ON_REQS = 3 };
+
+/* pssvm_req_t.api; mem's fn is 0 read, 1 write; a user API's, the fn_id */
+enum { PSSVM_API_MEM = 0, PSSVM_API_CONFIG = 1, PSSVM_API_SEQ = 2, PSSVM_API_USER = 16 };
+#define PSSVM_NO_EXECUTOR 0xFFFFFFFFu
 
 /* pssvm_notify kinds; host-fed channels (CHAN) have no handler yet */
 enum { PSSVM_N_IRQ = 1, PSSVM_N_CHAN = 2 };
 #define PSSVM_NOTES_MAX 64
 
-/* The pending request of a call that pssvm_run left in ACCESS, IMPORT or WAIT.
- * `args` points into the call and is valid until the next call on it. */
+/* A request (pssvm_take), or what a WAIT or STOP waits on (pssvm_request).
+ * Its pointers are valid until it is completed or the call ends. */
 typedef struct {
-    int32_t        status;     /* PSSVM_ACCESS / PSSVM_IMPORT */
-    uint32_t       kind;       /* ACCESS: 0 read, 1 write */
+    int32_t        status;     /* PSSVM_REQS / PSSVM_WAIT / PSSVM_STOP */
+    uint32_t       req_id;     /* REQS: unique among the call's outstanding */
+    uint32_t       api;        /* PSSVM_API_* */
+    uint32_t       fn;         /* mem: 0 read, 1 write; user: the import's fn_id */
+    uint32_t       thread;     /* engine thread id (the debug stub's) */
+    uint32_t       executor;   /* PSSVM_NO_EXECUTOR: none */
+    uint32_t       kind;       /* mem: 0 read, 1 write */
     uint64_t       addr;
     uint32_t       size;       /* bytes: 1, 2, 4, 8 */
     uint64_t       data;       /* write data, little-endian u64 */
     uint32_t       reg_id;     /* 0xFFFFFFFF: not a register access / unknown */
     uint32_t       src_ref;    /* 0xFFFFFFFF: unknown */
-    uint32_t       fn_id;      /* IMPORT: */
     const char    *name;       /* the import's name (image IMPORT table), else NULL */
     const uint8_t *args;       /* value ABI: u64 leaves */
     size_t         args_len;
@@ -79,8 +89,10 @@ typedef struct {
     uint32_t       has_ret;    /* the answer is one u64 (else empty) */
     uint32_t       on;         /* WAIT: PSSVM_ON_TIME / PSSVM_ON_EVENT */
     uint64_t       delay;      /* WAIT TIME: engine ticks (ps) */
-    uint32_t       bound;      /* IMPORT: 1 = a call of a pssvm_bind function;
-                                * fn_id is its coroutine, args its arguments */
+    uint32_t       bound;      /* user: 1 = a call of a pssvm_bind function;
+                                * fn is its coroutine, args its arguments */
+    uint32_t       nret;       /* user: values the answer holds, 8 bytes each
+                                * (0 none, 1 a scalar, n a struct's leaves) */
 } pssvm_req_t;
 
 typedef struct pssvm_s      pssvm_t;
@@ -96,6 +108,20 @@ int           pssvm_fresh(pssvm_t *e, const char *root_type);
 /* The text of the image's host metadata document `name` (debug images;
  * pssc writes them), or NULL. Valid while `e` is. */
 const char   *pssvm_meta(pssvm_t *e, const char *name);
+/* F5.4a: the executor id (EXEC row) of the executor instance at `path`, or
+ * -1; and the path of executor `id` (NULL: none). Valid while `e` is. */
+int           pssvm_exec_id(pssvm_t *e, const char *path);
+const char   *pssvm_exec_path(pssvm_t *e, uint32_t id);
+/* F6.3a: the text of model string `idx` (a string argument of an import
+ * arrives as this index), or NULL out of range. Valid while `e` is. */
+const char   *pssvm_string(pssvm_t *e, uint32_t idx);
+/* F5.5a: the event id (EVENT row; notify(PSSVM_N_CHAN, id, value)) of the
+ * host-fed channel at instance `path`, or -1. */
+int           pssvm_event_id(pssvm_t *e, const char *path);
+/* F5.7: one WAIT TIME tick is 10^time_exp s (the DPI set_time stays fs)
+ * (IDENT; -12 = ps, also for an image without IDENT). */
+int           pssvm_time_exp(pssvm_t *e);
+/* An action entry gets a zeroed object the call owns (freed by pssvm_call_end). */
 pssvm_call_t *pssvm_call_start(pssvm_t *e, const char *entry, const char *comp_path,
                                const uint8_t *args, size_t len, uint64_t seed);
 /* As pssvm_call_start, with an action object: `n_slots` fields in `slots`,
@@ -105,9 +131,15 @@ pssvm_call_t *pssvm_call_start_obj(pssvm_t *e, const char *entry, const char *co
                                    uint64_t *slots, uint32_t n_slots);
 int           pssvm_run(pssvm_call_t *h);
 const pssvm_req_t *pssvm_request(pssvm_call_t *h);
-int           pssvm_complete(pssvm_call_t *h, const uint8_t *data, size_t len);
+const pssvm_req_t *pssvm_take(pssvm_call_t *h);   /* the new request, or NULL */
+int           pssvm_complete(pssvm_call_t *h, uint32_t req_id,
+                             const uint8_t *data, size_t len);
 size_t        pssvm_result(pssvm_call_t *h, uint8_t *buf, size_t cap);
 void          pssvm_call_end(pssvm_call_t *h);
+/* F5.6: after DONE of an action entry's call (and before pssvm_call_end),
+ * the value of its object's field `name` (as the ENTRY's obj layout names
+ * it) in *out. PSSVM_E_STATE: not done; PSSVM_E_ARGS: no such field. */
+int           pssvm_call_field(pssvm_call_t *h, const char *name, uint64_t *out);
 const char   *pssvm_error(pssvm_t *e, pssvm_call_t *h);
 void          pssvm_free(pssvm_t *e);
 
@@ -120,7 +152,7 @@ int           pssvm_notify(pssvm_t *e, uint32_t kind, uint32_t id, uint64_t valu
 int           pssvm_set_irq(pssvm_t *e, const char *entry);
 
 /* Bind (on != 0) or unbind coroutine `coro`: from the next call on, each
- * CALL of it is an IMPORT request with `bound` set that the host answers with
+ * CALL of it is a user-API request with `bound` set that the host answers with
  * the function's result (pssvm_complete), in place of its body.
  * PSSVM_E_ARGS: no such coroutine. */
 int           pssvm_bind(pssvm_t *e, uint32_t coro, int on);

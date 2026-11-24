@@ -1,9 +1,11 @@
 """The C engine's host ABI from Python (``pssvm.h``, P4.3d).
 
-The same shape as be-bc's ``zuspec.be.bc.interp.host``: a call runs until it
-needs its host and hands it a :class:`Request` (a memory access, a user
-import, or a wait); the host answers with :meth:`NativeCall.complete` and
-runs the call on with :meth:`NativeCall.run`::
+The same shape as be-bc's ``zuspec.be.bc.interp.host`` (host ABI 2): a call
+runs until it needs its host; on ``REQS`` the host takes each new
+:class:`Request` (an API call: a memory access, a user import) with
+:meth:`NativeCall.take`, answers it with :meth:`NativeCall.complete` (its
+``req_id``) and runs the call on with :meth:`NativeCall.run`. The C engine
+keeps one request outstanding (several at once: M14)::
 
     eng = Engine(lib, image)
     call = eng.call("entry", [arg])
@@ -15,9 +17,9 @@ built with :func:`zuspec.rt.eng.build.build_shared_lib`.
 
 A call whose threads all wait on something only the host can change returns
 WAIT on ``"EVENT"``; :meth:`NativeCall.notify` (an interrupt, started as the
-handler :meth:`Engine.set_irq` names) lets it go on (P4.4e). Not here yet:
-host-fed channels (``N_CHAN`` has no handler) and constructing a root other
-than the image's own.
+handler :meth:`Engine.set_irq` names) lets it go on (P4.4e), as does a put on
+a host-fed channel (``N_CHAN``, its EVENT row id; F5.5b). Not here yet:
+constructing a root other than the image's own.
 """
 from __future__ import annotations
 
@@ -27,15 +29,19 @@ import struct
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
-#: run status (``pssvm_run``), as be-bc's host.py
-DONE, ACCESS, IMPORT, WAIT, STOP, ERROR = 0, 1, 2, 3, 4, -1
-STATUS_NAMES = {DONE: "DONE", ACCESS: "ACCESS", IMPORT: "IMPORT", WAIT: "WAIT",
-                STOP: "STOP", ERROR: "ERROR"}
+#: run status (``pssvm_run``), as be-bc's host.py (2, the old IMPORT, is unused)
+DONE, REQS, WAIT, STOP, ERROR = 0, 1, 3, 4, -1
+STATUS_NAMES = {DONE: "DONE", REQS: "REQS", WAIT: "WAIT", STOP: "STOP",
+                ERROR: "ERROR"}
+#: request APIs and mem functions (``pssvm_req_t.api`` / ``fn``)
+API_MEM, API_CONFIG, API_SEQ, API_USER = 0, 1, 2, 16
+FN_READ, FN_WRITE = 0, 1
+NO_EXECUTOR = 0xFFFFFFFF
 
 PSSVM_OK, PSSVM_E_STATE = 0, -2
 #: notify kinds (``pssvm_notify``), as be-bc's host.py
 N_IRQ, N_CHAN = 1, 2
-_ON = {1: "TIME", 2: "EVENT"}
+_ON = {1: "TIME", 2: "EVENT", 3: "REQS"}
 _NONE32 = 0xFFFFFFFF
 
 
@@ -53,42 +59,56 @@ class NativeError(RuntimeError):
 
 @dataclass
 class Request:
-    """What :meth:`NativeCall.run` returned: ``status`` and its fields (the
-    fields of be-bc's ``host.Request``)."""
+    """What :meth:`NativeCall.run` returned (``status``; for WAIT, ``on`` and
+    ``delay``), or a request :meth:`NativeCall.take` gave: the fields of
+    be-bc's ``host.Request``."""
     status: int
+    req_id: int = 0
+    api: int = API_MEM
+    fn: int = 0
+    thread: int = 0
+    executor: int = NO_EXECUTOR
     kind: str = ""
     addr: int = 0
     size: int = 0
     data: Optional[int] = None
     reg_id: Optional[int] = None
     src_ref: int = 0
-    fn_id: int = 0
     name: Optional[str] = None
     args: List[int] = field(default_factory=list)
     blocking: bool = False
     has_ret: bool = False
+    nret: int = 0         # user API: values the answer holds (n: a struct's leaves)
     on: str = ""
     delay: int = 0
     error: Optional[dict] = None
     exc: Optional[BaseException] = None
-    bound: bool = False   # IMPORT: a call of an Engine.bind function (fn_id: its coroutine)
+    bound: bool = False   # user API: a call of an Engine.bind function (fn: its coroutine)
 
     @property
     def status_name(self) -> str:
         return STATUS_NAMES[self.status]
 
+    @property
+    def fn_id(self) -> int:
+        return self.fn
+
 
 class _Req(ctypes.Structure):
     """Mirror of ``pssvm_req_t``."""
     _fields_ = [
-        ("status", ctypes.c_int32), ("kind", ctypes.c_uint32),
+        ("status", ctypes.c_int32), ("req_id", ctypes.c_uint32),
+        ("api", ctypes.c_uint32), ("fn", ctypes.c_uint32),
+        ("thread", ctypes.c_uint32), ("executor", ctypes.c_uint32),
+        ("kind", ctypes.c_uint32),
         ("addr", ctypes.c_uint64), ("size", ctypes.c_uint32),
         ("data", ctypes.c_uint64), ("reg_id", ctypes.c_uint32),
-        ("src_ref", ctypes.c_uint32), ("fn_id", ctypes.c_uint32),
+        ("src_ref", ctypes.c_uint32),
         ("name", ctypes.c_char_p), ("args", ctypes.POINTER(ctypes.c_uint8)),
         ("args_len", ctypes.c_size_t), ("blocking", ctypes.c_uint32),
         ("has_ret", ctypes.c_uint32), ("on", ctypes.c_uint32),
         ("delay", ctypes.c_uint64), ("bound", ctypes.c_uint32),
+        ("nret", ctypes.c_uint32),
     ]
 
 
@@ -181,10 +201,18 @@ def bind(lib) -> ctypes.CDLL:
         "pssvm_call_end": ([vp], None),
         "pssvm_error": ([vp, vp], ctypes.c_char_p),
         "pssvm_free": ([vp], None),
+        "pssvm_exec_id": ([vp, ctypes.c_char_p], ctypes.c_int),
+        "pssvm_exec_path": ([vp, ctypes.c_uint32], ctypes.c_char_p),
+        "pssvm_string": ([vp, ctypes.c_uint32], ctypes.c_char_p),
+        "pssvm_event_id": ([vp, ctypes.c_char_p], ctypes.c_int),
+        "pssvm_time_exp": ([vp], ctypes.c_int),
+        "pssvm_call_field": ([vp, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint64)],
+                             ctypes.c_int),
         "pssvm_call_status": ([vp, ctypes.POINTER(ctypes.c_int),
                                ctypes.POINTER(ctypes.c_uint64)], ctypes.c_int),
         "pssvm_request": ([vp], ctypes.POINTER(_Req)),
-        "pssvm_complete": ([vp, u8p, sz], ctypes.c_int),
+        "pssvm_take": ([vp], ctypes.POINTER(_Req)),
+        "pssvm_complete": ([vp, ctypes.c_uint32, u8p, sz], ctypes.c_int),
         "pssvm_comp_read": ([vp, vp, sz], sz),
         "pssvm_comp_write": ([vp, vp, sz], sz),
         "pssvm_reload": ([vp, u8p, sz, ctypes.c_uint32], ctypes.c_int),
@@ -415,7 +443,7 @@ class Engine:
 
     def bind(self, coro: int, on: bool = True) -> None:
         """From the next call on, each CALL of coroutine ``coro`` is an
-        IMPORT request with ``bound`` set (``fn_id``: ``coro``, ``args``: the
+        user-API request with ``bound`` set (``fn``: ``coro``, ``args``: the
         call's), answered with the function's result in place of its body,
         as be-bc's ``VM.bind`` does; ``on=False`` unbinds it."""
         if not self._h:
@@ -490,6 +518,35 @@ class Engine:
         self.lib.pssvm_comp_read(self._h, buf, n)
         return list(buf[:n])
 
+    def exec_id(self, path: str) -> int:
+        """The executor id (EXEC row) of the executor instance at ``path``,
+        or -1 (F5.4a)."""
+        return self.lib.pssvm_exec_id(self._h, path.encode()) if self._h else -1
+
+    def event_id(self, path: str) -> int:
+        """The event id (EVENT row; ``notify(N_CHAN, id, v)``) of the
+        host-fed channel at ``path``, or -1 (F5.5a)."""
+        return self.lib.pssvm_event_id(self._h, path.encode()) if self._h else -1
+
+    def time_exp(self) -> int:
+        """One WAIT TIME tick is ``10**time_exp`` s (IDENT; -12 default, F5.7)."""
+        return self.lib.pssvm_time_exp(self._h) if self._h else -12
+
+    def exec_path(self, id: int) -> str:
+        """The path of executor ``id``; "" for none (F5.4a)."""
+        if not self._h or id < 0:
+            return ""
+        p = self.lib.pssvm_exec_path(self._h, id)
+        return p.decode() if p else ""
+
+    def string(self, idx: int) -> Optional[str]:
+        """The text of model string ``idx`` (an import's string argument
+        arrives as this index); None out of range (F6.3a)."""
+        if not self._h or idx < 0:
+            return None
+        p = self.lib.pssvm_string(self._h, idx)
+        return p.decode() if p is not None else None
+
     def construct(self) -> None:
         """Build the component tree now (``pssvm_construct``) rather than at
         the first call. Construction must not need the host: a memory access
@@ -547,7 +604,8 @@ class NativeCall:
         self.engine = engine
         self.lib = engine.lib
         self._h = h
-        self._pending: Optional[Request] = None
+        self._new: List[Request] = []           # taken from C, not yet by the host
+        self._out: Dict[int, Request] = {}      # outstanding, by req_id
         self._failed: Optional[BaseException] = None
         self._last: Optional[Request] = None
         self._result: Optional[int] = None
@@ -564,8 +622,6 @@ class NativeCall:
             r = Request(ERROR, error={"message": str(exc)}, exc=exc)
             self._finish(r)
             return r
-        if self._pending is not None:
-            raise HostStateError(f"the {self._pending.status_name} is not answered")
         st = self.lib.pssvm_run(self._h)
         if st == DONE:
             buf = (ctypes.c_uint8 * 8)()
@@ -579,10 +635,15 @@ class NativeCall:
             self._finish(r)
         elif st == STOP:
             r = Request(STOP, src_ref=self.lib.pssvm_request(self._h).contents.src_ref)
-        elif st in (ACCESS, IMPORT, WAIT):
-            r = self._request(st)
-            if st != WAIT:
-                self._pending = r
+        elif st == REQS:
+            while (p := self.lib.pssvm_take(self._h)):
+                q = self._request(p.contents)
+                self._new.append(q)
+                self._out[q.req_id] = q
+            r = Request(REQS)
+        elif st == WAIT:
+            q = self.lib.pssvm_request(self._h).contents
+            r = Request(WAIT, on=_ON.get(q.on, ""), delay=q.delay)
         else:
             raise HostStateError(f"pssvm_run gave {st}")
         self._last = r
@@ -641,30 +702,38 @@ class NativeCall:
         if self.lib.pssvm_dbg_resume(self._h, kind) != PSSVM_OK:
             raise HostStateError("the call is not stopped")
 
-    def _request(self, st: int) -> Request:
-        q = self.lib.pssvm_request(self._h).contents
-        if st == ACCESS:
-            return Request(ACCESS, kind="w" if q.kind else "r", addr=q.addr,
+    def _request(self, q) -> Request:
+        """A request ``pssvm_take`` gave, copied out of the call."""
+        ids = dict(req_id=q.req_id, api=q.api, fn=q.fn, thread=q.thread,
+                   executor=q.executor,
+                   src_ref=0 if q.src_ref == _NONE32 else q.src_ref)
+        if q.api == API_MEM:
+            return Request(REQS, kind="w" if q.kind else "r", addr=q.addr,
                            size=q.size, data=q.data if q.kind else None,
                            reg_id=None if q.reg_id == _NONE32 else q.reg_id,
-                           src_ref=0 if q.src_ref == _NONE32 else q.src_ref)
-        if st == IMPORT:
-            raw = bytes(q.args[:q.args_len]) if q.args_len else b""
-            return Request(IMPORT, fn_id=q.fn_id,
-                           name=q.name.decode() if q.name else None,
-                           args=list(struct.unpack("<%dQ" % (len(raw) // 8), raw)),
-                           blocking=bool(q.blocking), has_ret=bool(q.has_ret),
-                           bound=bool(q.bound),
-                           src_ref=0 if q.src_ref == _NONE32 else q.src_ref)
-        return Request(WAIT, on=_ON.get(q.on, ""), delay=q.delay)
+                           blocking=True, **ids)
+        raw = bytes(q.args[:q.args_len]) if q.args_len else b""
+        return Request(REQS, name=q.name.decode() if q.name else None,
+                       args=list(struct.unpack("<%dQ" % (len(raw) // 8), raw)),
+                       blocking=bool(q.blocking), has_ret=bool(q.has_ret),
+                       nret=q.nret, bound=bool(q.bound), **ids)
 
-    def complete(self, value: Optional[int] = None) -> None:
-        """Answer the pending access or import: the read value, the import's
-        result (None: none), nothing for a write."""
-        r = self._pending
-        if r is None:
-            raise HostStateError("nothing to complete")
-        if r.status == ACCESS:
+    def take(self) -> Optional[Request]:
+        """The next new request, in issue order (None: none)."""
+        return self._new.pop(0) if self._new else None
+
+    def _req(self, req_id: int) -> Request:
+        try:
+            return self._out[req_id]
+        except KeyError:
+            raise HostStateError(f"request {req_id} is not outstanding") from None
+
+    def complete(self, req_id: int, value: Optional[int] = None) -> None:
+        """Answer outstanding request ``req_id``: the read value, the
+        import's result (None: none; a sequence of ``nret`` values for a
+        struct result), nothing for a write."""
+        r = self._req(req_id)
+        if r.api == API_MEM:
             if r.kind == "r":
                 if value is None:
                     raise HostStateError("a read completes with its value")
@@ -675,20 +744,22 @@ class NativeCall:
                 data = b""
         else:
             # an import without a result drops what the mock returned
-            data = (struct.pack("<Q", int(value or 0) & (2**64 - 1))
+            vals = (list(value) if isinstance(value, (list, tuple))
+                    else [value or 0])
+            data = (struct.pack("<%dQ" % len(vals),
+                                *(int(v) & (2**64 - 1) for v in vals))
                     if r.has_ret else b"")
-        if self.lib.pssvm_complete(self._h, data or None, len(data)) != PSSVM_OK:
+        if self.lib.pssvm_complete(self._h, req_id, data or None, len(data)) != PSSVM_OK:
             raise HostStateError(_error(self.lib, self.engine._h, self._h)
                                  .get("message", "pssvm_complete refused"))
-        self._pending = None
+        del self._out[req_id]
 
-    def fail(self, exc: BaseException) -> None:
-        """Answer the pending access or import with an error: the next
-        :meth:`run` is ERROR with ``exc`` (the C engine cannot raise it where
-        the access was made, so a model cannot catch it)."""
-        if self._pending is None:
-            raise HostStateError("nothing to fail")
-        self._pending = None
+    def fail(self, req_id: int, exc: BaseException) -> None:
+        """Answer request ``req_id`` with an error: the next :meth:`run` is
+        ERROR with ``exc`` (the C engine cannot raise it where the access was
+        made, so a model cannot catch it)."""
+        self._req(req_id)
+        del self._out[req_id]
         self._failed = exc
 
     def notify(self, kind: int, id: int = 0, value: int = 0) -> None:
@@ -712,6 +783,18 @@ class NativeCall:
             raise HostStateError("the call is not DONE")
         return self._result
 
+    def field(self, name: str) -> int:
+        """Field ``name`` of an action entry's object after DONE (F5.6)."""
+        if not self._h:
+            raise HostStateError("the call is ended")
+        v = ctypes.c_uint64()
+        rc = self.lib.pssvm_call_field(self._h, name.encode(), ctypes.byref(v))
+        if rc == -2:
+            raise HostStateError("the call is not DONE")
+        if rc != 0:
+            raise NativeError(_error(self.lib, self.engine._h, self._h))
+        return v.value
+
     def status(self):
         """(ZBC status, halting op, engine time) of the call."""
         halted, now = ctypes.c_int(), ctypes.c_uint64()
@@ -729,6 +812,27 @@ class NativeCall:
             self.lib.pssvm_call_end(self._h)
             self._h = None
         self.over = True
+
+
+def _serve(q: Request, memory, import_provider, bound, note):
+    """Answer one request from run_sync's providers (None: no value)."""
+    if q.api != API_MEM and q.bound:
+        fn = (bound or {}).get(q.fn)
+        if fn is None:
+            raise NativeError({"message": f"no host function bound to coroutine {q.fn}"})
+        return fn(*q.args)
+    if q.api != API_MEM:
+        if import_provider is None:
+            raise NativeError({"message": f"no import provider for fn {q.fn}"})
+        return import_provider.call(q.fn, q.args)
+    if memory is None:
+        raise NativeError({"message": f"no memory for access at {q.addr:#x}"})
+    if note is not None:
+        note(q.reg_id, q.src_ref)
+    if q.kind == "r":
+        return memory.read(q.addr, q.size)
+    memory.write(q.addr, q.size, q.data)
+    return None
 
 
 def run_sync(call: NativeCall, memory=None, import_provider=None,
@@ -751,31 +855,16 @@ def run_sync(call: NativeCall, memory=None, import_provider=None,
             r = call.run()
             if r.status == DONE:
                 return call.result
-            if r.status in (ACCESS, IMPORT):
-                try:
-                    if r.status == IMPORT and r.bound:
-                        fn = (bound or {}).get(r.fn_id)
-                        if fn is None:
-                            raise NativeError({"message": f"no host function bound to coroutine {r.fn_id}"})
-                        v = fn(*r.args)
-                    elif r.status == IMPORT:
-                        if import_provider is None:
-                            raise NativeError({"message": f"no import provider for fn {r.fn_id}"})
-                        v = import_provider.call(r.fn_id, r.args)
-                    elif memory is None:
-                        raise NativeError({"message": f"no memory for access at {r.addr:#x}"})
-                    else:
-                        if note is not None:
-                            note(r.reg_id, r.src_ref)
-                        if r.kind == "r":
-                            v = memory.read(r.addr, r.size)
-                        else:
-                            memory.write(r.addr, r.size, r.data)
-                            v = None
-                except BaseException as e:
-                    call.fail(e)
-                    continue
-                call.complete(v)
+            if r.status == REQS:
+                while (q := call.take()) is not None:
+                    try:
+                        v = _serve(q, memory, import_provider, bound, note)
+                    except BaseException as e:
+                        call.fail(q.req_id, e)
+                        continue
+                    call.complete(q.req_id, v)
+            elif r.status == WAIT and r.on == "REQS":
+                raise HostStateError("run_sync left a request unanswered")
             elif r.status == WAIT:
                 if r.on == "EVENT":
                     raise NativeError({"message": "deadlock: the call waits on an "

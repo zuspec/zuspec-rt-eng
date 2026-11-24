@@ -49,23 +49,28 @@ def test_a_c_request_names_its_register(_rawlib):
     with nhost.Engine(_rawlib, _tabled().to_bytes()) as eng:
         call = eng.call()
         while (r := call.run()).status != nhost.DONE:
-            if r.status in (nhost.ACCESS, nhost.IMPORT):
-                ids.append((r.status_name, r.reg_id))
-                call.complete(0 if (r.status == nhost.ACCESS and r.kind == "r")
-                              or r.has_ret else None)
+            if r.status == nhost.REQS:
+                q = call.take()
+                ids.append((q.api, q.reg_id))
+                call.complete(q.req_id, 0 if (q.api == nhost.API_MEM and q.kind == "r")
+                              or q.has_ret else None)
         call.end()
-    assert ids == [("ACCESS", 5), ("ACCESS", 7), ("IMPORT", None), ("IMPORT", None)]
+    M, U = nhost.API_MEM, nhost.API_USER
+    assert ids == [(M, 5), (M, 7), (U, None), (U, None)]
 
 
 def test_without_tables_a_request_names_no_register(_rawlib):
     with nhost.Engine(_rawlib, _code_model(_IO).to_bytes()) as eng:
         call = eng.call()
-        r = call.run()
-        assert r.status == nhost.ACCESS and r.reg_id is None
-        call.complete(None)
+        assert call.run().status == nhost.REQS
+        q = call.take()
+        assert q.api == nhost.API_MEM and q.kind == "w" and q.reg_id is None
+        call.complete(q.req_id, None)
         while (r := call.run()).status != nhost.DONE:
-            if r.status in (nhost.ACCESS, nhost.IMPORT):
-                call.complete(0 if r.status == nhost.ACCESS or r.has_ret else None)
+            if r.status == nhost.REQS:
+                q = call.take()
+                call.complete(q.req_id, 0 if (q.api == nhost.API_MEM and q.kind == "r")
+                              or q.has_ret else None)
         call.end()
 
 
@@ -90,10 +95,11 @@ def test_a_c_request_names_its_source(_rawlib):
     with nhost.Engine(_rawlib, m.to_bytes()) as eng:
         call = eng.call()
         while (r := call.run()).status != nhost.DONE:
-            if r.status in (nhost.ACCESS, nhost.IMPORT):
-                seen.append(r.src_ref)
-                call.complete(0 if (r.status == nhost.ACCESS and r.kind == "r")
-                              or r.has_ret else None)
+            if r.status == nhost.REQS:
+                q = call.take()
+                seen.append(q.src_ref)
+                call.complete(q.req_id, 0 if (q.api == nhost.API_MEM and q.kind == "r")
+                              or q.has_ret else None)
         call.end()
     assert seen == [1, 0, 2, 0]
 

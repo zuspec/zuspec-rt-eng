@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PSSVM_ERR_MAX 512
+#define PSSVM_ERR_MAX 2048
 
 enum { CALL_READY, CALL_DONE, CALL_ERROR };
 
@@ -30,6 +30,7 @@ struct pssvm_s {
     zbc_host_t  *host;
     uint32_t     verbosity;     /* pssvm_load's `verbosity=N`, with no host */
     uint64_t     step_limit;    /* pssvm_load's `step_limit=N` (zbc_host_t's) */
+    uint32_t     seed_keyed;    /* keyed seeds: pssvm_load's `seed_mode` and SEEDKEY (zbc_host_t's) */
     struct zbc_ev_sink_s *events; /* pssvm_set_events, or NULL */
     uint32_t     irq_coro;      /* pssvm_set_irq's handler (0xFFFFFFFF: none) */
     uint8_t     *bound;         /* pssvm_bind's, per coroutine, or NULL */
@@ -44,20 +45,30 @@ struct pssvm_s {
 
 struct pssvm_call_s {
     pssvm_t        *e;
+    int             noop;      /* nothing to run: DONE at once ($run_end) */
     uint64_t        seed;
     zsp_timebase_t *tb;
     zbc_result_t    res;
     uint64_t        args[ZBC_CALL_MAX_ARGS];
+    uint32_t        pin_slot[ZBC_CALL_MAX_ARGS];   /* an action's arguments (F2.3b) */
+    int64_t         pin_val[ZBC_CALL_MAX_ARGS];
+    uint32_t        n_pins;
     uint64_t        spawn_budget;
     int             state;
     int             has_ret;
     zbc_host_t      host;       /* the engine's, with imports and memory yielding */
     zbc_yield_t     yield;      /* the pending request, in engine terms */
-    pssvm_req_t     req;        /* ... and as pssvm_request shows it */
+    pssvm_req_t     req;        /* ... and as pssvm_take / pssvm_request show it */
+    uint32_t        next_req;   /* the last req_id given */
+    int             taken;      /* the pending request was taken */
+    pssvm_req_t     wait_reqs;  /* pssvm_request after a WAIT on REQS */
+    int             in_wait_reqs;
     uint8_t         req_args[8 * ZBC_CALL_MAX_ARGS];
     char            call[96];   /* the entry's name, JSON-escaped ("" = the image's) */
     char            err[PSSVM_ERR_MAX];
     zbc_obj_t       obj;        /* the action object (pssvm_call_start_obj) */
+    uint64_t       *own_slots;  /* ... when pssvm_call_start allocated it */
+    const char     *layout;     /* the action entry's object layout (JSON), or NULL */
 };
 
 /* The host a run under `e` uses: the engine's messages, verbosity and import
@@ -75,8 +86,11 @@ static void call_host(pssvm_t *e, zbc_host_t *host, zbc_yield_t *y) {
     }
     if (e->events) host->events = e->events;
     host->step_limit = e->step_limit;
+    host->seed_stream = !e->seed_keyed;
     memset(y, 0, sizeof(*y));
     y->err_coro = 0xFFFFFFFFu;
+    y->err_solve = 0xFFFFFFFFu;
+    y->err_act = 0xFFFFFFFFu;
     host->yield = y;
     host->bound = e->bound;
     host->dbg = e->dbg_on ? &e->dbg : NULL;
@@ -147,7 +161,10 @@ pssvm_t *pssvm_load(const uint8_t *img, size_t len, const char *opts) {
     /* opts: `verbosity=N`, the highest message() level a run with no host
      * (pssvm_set_host) reports (default 0: only NONE); `step_limit=N`, the
      * bytecode steps each frame may run (default ZBC_STEP_LIMIT; 0: no
-     * limit, as on the Python VM) */
+     * limit, as on the Python VM); `seed_mode=keyed` (the default when the
+     * image has SEEDKEY), children's seeds by what they traverse, not their
+     * position (F3.9; explicit keyed needs SEEDKEY); `seed_mode=stream`, by
+     * position */
     g_load_err[0] = 0;
     if (img == NULL) {
         set_err(g_load_err, PSSVM_E_IMAGE, 0, "no image");
@@ -163,6 +180,9 @@ pssvm_t *pssvm_load(const uint8_t *img, size_t len, const char *opts) {
         uint64_t n = (uint64_t)strtoull(sl + 11, NULL, 10);
         e->step_limit = n ? n : ZBC_STEP_UNLIMITED;
     }
+    const char *sm = opts ? strstr(opts, "seed_mode=") : NULL;
+    int keyed_asked = sm && strncmp(sm + 10, "keyed", 5) == 0;
+    e->seed_keyed = !(sm && strncmp(sm + 10, "stream", 6) == 0);
     e->data = (uint8_t *)malloc(len ? len : 1);
     memcpy(e->data, img, len);
     int rc = zbc_image_open(&e->img, e->data, len);
@@ -172,6 +192,14 @@ pssvm_t *pssvm_load(const uint8_t *img, size_t len, const char *opts) {
         free(e);
         return NULL;
     }
+    if (keyed_asked && !e->img.seed_keys) {
+        set_err(g_load_err, PSSVM_E_IMAGE, 0,
+                "seed_mode=keyed: the image has no seed keys (SEEDKEY)");
+        free(e->data);
+        free(e);
+        return NULL;
+    }
+    if (!e->img.seed_keys) e->seed_keyed = 0;
     e->img.spin_stuck = &e->spin_stuck;
     zsp_alloc_malloc_init(&e->alloc);
     return e;
@@ -192,6 +220,17 @@ static int check_image(pssvm_t *e, char *err) {
     zbc_yield_t y;
     call_host(e, &host, &y);
     int rc = zbc_image_check(&e->img, &host, &halted);
+    if (rc == ZBC_ERR_UNSUPPORTED_OP && halted == ZBC_OP_HEAP) {
+        /* heap.md s.9: name what the C engine lacks, not just the opcode. */
+        set_err(err, PSSVM_E_IMAGE, halted, "image not runnable: heap ops (strings built at "
+                "run time, list/map/set) are not supported by the C engine yet (M14)");
+        return PSSVM_E_IMAGE;
+    }
+    if (rc == ZBC_ERR_UNSUPPORTED_OP && halted == ZBC_HALT_ADDR_CLAIM) {
+        set_err(err, PSSVM_E_IMAGE, 0, "image not runnable: address claims (the run's "
+                "claim ledger and contiguous placement) are not supported by the C engine yet (M14)");
+        return PSSVM_E_IMAGE;
+    }
     if (rc != ZBC_OK) {
         set_err(err, PSSVM_E_IMAGE, halted, "image not runnable: %s (%d)",
                 zbc_status_name(rc), rc);
@@ -267,6 +306,41 @@ int pssvm_fresh(pssvm_t *e, const char *root_type) {
 
 const char *pssvm_meta(pssvm_t *e, const char *name) {
     return e ? zbc_image_meta(&e->img, name) : NULL;
+}
+
+int pssvm_exec_id(pssvm_t *e, const char *path) {
+    if (e == NULL || path == NULL) return -1;
+    for (uint32_t i = 0; i < e->img.exec_count; i++) {
+        const char *p = zbc_image_str(&e->img, e->img.execs[i].path);
+        if (p && !strcmp(p, path)) return (int)i;
+    }
+    return -1;
+}
+
+const char *pssvm_exec_path(pssvm_t *e, uint32_t id) {
+    return e && id < e->img.exec_count
+           ? zbc_image_str(&e->img, e->img.execs[id].path) : NULL;
+}
+
+const char *pssvm_string(pssvm_t *e, uint32_t idx) {
+    const zbc_msgtab *mt = e ? e->img.msgtab : NULL;
+    return mt && idx < mt->n_model_strings
+           ? e->img.msgstrb + e->img.msgstr_off[idx] : NULL;
+}
+
+int pssvm_event_id(pssvm_t *e, const char *path) {
+    if (e == NULL || path == NULL) return -1;
+    for (uint32_t i = 0; i < e->img.event_count; i++) {
+        const char *p = zbc_image_str(&e->img, e->img.events[i].path);
+        if (p && !strcmp(p, path)) return (int)i;
+    }
+    return -1;
+}
+
+int pssvm_time_exp(pssvm_t *e) {
+    if (e == NULL || e->img.ident == NULL
+            || e->img.ident_size < sizeof(zbc_ident)) return -12;
+    return (int32_t)e->img.ident->time_exp;
 }
 
 size_t pssvm_comp_read(pssvm_t *e, uint64_t *buf, size_t cap) {
@@ -407,6 +481,7 @@ int pssvm_reload(pssvm_t *e, const uint8_t *img, size_t len, uint32_t flags) {
     n->events = e->events;
     n->verbosity = e->verbosity;
     n->step_limit = e->step_limit;
+    n->seed_keyed = e->seed_keyed;
     if (e->constructed) {
         /* N+1's tree is built beside N's; it must not touch the bus. */
         int rc = pssvm_construct(n, NULL, NULL, 0);
@@ -450,9 +525,143 @@ int pssvm_reload(pssvm_t *e, const uint8_t *img, size_t len, uint32_t flags) {
 
 uint64_t pssvm_generation(pssvm_t *e) { return e ? e->gen : 0; }
 
+/* The slots of action entry `entry`'s object (NULL or "": the image's entry
+ * coroutine), as pssc native.py `_action_obj` counts them: its activation's
+ * size, else the fields of the ENTRY obj layout; 0 for a function or none. */
+/* The entry named `entry`: its symbol, or an action's qualified type
+ * (`pss_top::A`); NULL or "": the one on the image's entry coroutine. */
+/* The elements of the JSON list `[[name, descriptor], ...]` at `p` (an
+ * entry's sig params or obj layout): items[i] is the '[' of element i.
+ * Returns their number (at most max), or -1 if `p` is not such a list. */
+static int json_pairs(const char *p, const char **items, int max) {
+    if (p == NULL || *p != '[') return -1;
+    int depth = 0, n = 0, str = 0;
+    for (; *p; p++) {
+        if (str) {
+            if (*p == '\\' && p[1]) p++;
+            else if (*p == '"') str = 0;
+            continue;
+        }
+        if (*p == '"') str = 1;
+        else if (*p == '[' || *p == '{') {
+            if (++depth == 2 && *p == '[' && n < max) items[n++] = p;
+        } else if (*p == ']' || *p == '}') {
+            if (--depth == 0) return n;
+        }
+    }
+    return -1;
+}
+
+/* Element `it` (from json_pairs) has name `name`. */
+static int json_pair_is(const char *it, const char *name) {
+    size_t k = strlen(name);
+    return it[1] == '"' && strncmp(it + 2, name, k) == 0 && it[2 + k] == '"';
+}
+
+/* `"key":<int>` in element `it` (up to its end); dflt if absent. */
+static long json_pair_int(const char *it, const char *key, long dflt) {
+    const char *end = strchr(it, ']');
+    const char *f = strstr(it, key);
+    if (f == NULL || (end && f > end)) return dflt;
+    f += strlen(key);
+    if (strncmp(f, "true", 4) == 0) return 1;
+    if (strncmp(f, "false", 5) == 0) return 0;
+    return strtol(f, NULL, 10);
+}
+
+/* An exported action's arguments fix its parameters' fields (LRM 20.10, F2.3b;
+ * pyvm VM._arg_bounds): each value cut to its parameter's width (and sign)
+ * pins the slot its name has in the entry's object layout. */
+static int action_pins(pssvm_t *e, const zbc_entry *en, pssvm_call_t *h,
+                       size_t nargs, const char *ename) {
+    const char *sig = en->sig ? zbc_image_str(&e->img, en->sig) : NULL;
+    const char *obj = en->obj ? zbc_image_str(&e->img, en->obj) : NULL;
+    const char *pp = sig ? strstr(sig, "\"params\":") : NULL;
+    const char *params[ZBC_CALL_MAX_ARGS], *fields[256];
+    int np = pp ? json_pairs(pp + 9, params, ZBC_CALL_MAX_ARGS) : 0;
+    int nf = json_pairs(obj, fields, 256);
+    if (np < 0) np = 0;
+    if ((size_t)np != nargs) {
+        set_err(e->err, PSSVM_E_ARGS, 0, "action %s takes %d arguments, not %u",
+                ename, np, (unsigned)nargs);
+        return PSSVM_E_ARGS;
+    }
+    for (int i = 0; i < np; i++) {
+        int slot = -1;
+        for (int f = 0; f < nf && slot < 0; f++) {
+            const char *q = params[i] + 2, *qe = strchr(q, '"');
+            char name[128];
+            size_t k = qe ? (size_t)(qe - q) : 0;
+            if (k >= sizeof(name)) k = sizeof(name) - 1;
+            memcpy(name, q, k);
+            name[k] = 0;
+            if (json_pair_is(fields[f], name)) slot = f;
+        }
+        if (slot < 0) {
+            set_err(e->err, PSSVM_E_ARGS, 0, "action %s: parameter %d is no field", ename, i);
+            return PSSVM_E_ARGS;
+        }
+        long w = json_pair_int(params[i], "\"width\":", 64);
+        int sgn = (int)json_pair_int(params[i], "\"signed\":", 0);
+        uint64_t v = h->args[i];
+        if (w > 0 && w < 64) {
+            v &= (1ull << w) - 1;
+            if (sgn && (v >> (w - 1))) v |= ~((1ull << w) - 1);
+        }
+        h->pin_slot[i] = (uint32_t)slot;
+        h->pin_val[i] = (int64_t)v;
+    }
+    h->n_pins = (uint32_t)np;
+    return PSSVM_OK;
+}
+
+static const zbc_entry *find_entry(pssvm_t *e, const char *entry) {
+    for (uint32_t i = 0; e->img.entries && i < e->img.entry_count; i++) {
+        const zbc_entry *x = &e->img.entries[i];
+        if (entry == NULL || entry[0] == 0) {
+            if (x->coro == e->img.entry_coro) return x;
+            continue;
+        }
+        const char *nm = zbc_image_str(&e->img, x->name);
+        if (nm && !strcmp(nm, entry)) return x;
+    }
+    if (entry == NULL || entry[0] == 0) return NULL;
+    for (uint32_t i = 0; e->img.entries && i < e->img.entry_count; i++) {
+        const zbc_entry *x = &e->img.entries[i];
+        const char *qn = x->kind == ZBC_ENTRY_ACTION && x->qname
+                         ? zbc_image_str(&e->img, x->qname) : NULL;
+        if (qn && !strcmp(qn, entry)) return x;
+    }
+    return NULL;
+}
+
+static uint32_t action_slots(pssvm_t *e, const char *entry) {
+    const zbc_entry *en = find_entry(e, entry);
+    if (en == NULL || en->kind != ZBC_ENTRY_ACTION) return 0;
+    const zbc_act *a = e->img.acttab ? zbc_image_act(&e->img, en->coro) : NULL;
+    if (a != NULL) return a->size;
+    const char *p = en->obj ? zbc_image_str(&e->img, en->obj) : NULL;
+    uint32_t n = 0;
+    int depth = 0, str = 0;
+    for (; p && *p; p++) {                 /* [[name, desc], ...]: depth-2 '[' */
+        if (str) { if (*p == '\\' && p[1]) p++; else if (*p == '"') str = 0; continue; }
+        if (*p == '"') str = 1;
+        else if (*p == '[' || *p == '{') { if (++depth == 2 && *p == '[') n++; }
+        else if (*p == ']' || *p == '}') depth--;
+    }
+    return n;
+}
+
 pssvm_call_t *pssvm_call_start(pssvm_t *e, const char *entry, const char *comp_path,
                                const uint8_t *args, size_t len, uint64_t seed) {
-    return pssvm_call_start_obj(e, entry, comp_path, args, len, seed, NULL, 0);
+    /* An action entry gets an object of its own, zeroed, which the call owns
+     * (pssvm_call_end frees it); use pssvm_call_start_obj to read it after. */
+    uint32_t n = e ? action_slots(e, entry) : 0;
+    uint64_t *slots = n ? (uint64_t *)calloc(n, sizeof(uint64_t)) : NULL;
+    pssvm_call_t *h = pssvm_call_start_obj(e, entry, comp_path, args, len, seed, slots, n);
+    if (h != NULL) h->own_slots = slots;
+    else free(slots);
+    return h;
 }
 
 /* The index (pre-order, as img.comp_bases) of the instance at `path`, from
@@ -481,16 +690,23 @@ pssvm_call_t *pssvm_call_start_obj(pssvm_t *e, const char *entry, const char *co
     }
     if (!e->constructed && pssvm_construct(e, NULL, NULL, 0) != PSSVM_OK) return NULL;
     if (check_image(e, e->err) != PSSVM_OK) return NULL;
+    if (entry != NULL && strcmp(entry, "$run_end") == 0) {
+        /* A simulation's end of run (F2.5): this engine refuses an image with
+         * exec run_start/run_end (ZBC_ERR_COMP_INIT), so it has none to run. */
+        pssvm_call_t *n = (pssvm_call_t *)calloc(1, sizeof(pssvm_call_t));
+        n->e = e;
+        n->noop = 1;
+        n->state = CALL_READY;
+        return n;
+    }
 
     /* NULL or "": the image's entry coroutine (header), result reported. */
     uint32_t coro = e->img.entry_coro;
     int has_ret = 1;
+    const zbc_entry *action = NULL;
+    const char *layout = NULL;
     if (entry != NULL && entry[0] != 0) {
-        const zbc_entry *found = NULL;
-        for (uint32_t i = 0; i < e->img.entry_count; i++) {
-            const char *nm = zbc_image_str(&e->img, e->img.entries[i].name);
-            if (nm && strcmp(nm, entry) == 0) { found = &e->img.entries[i]; break; }
-        }
+        const zbc_entry *found = find_entry(e, entry);
         if (found == NULL) {
             char esc[128];
             json_escape(esc, sizeof(esc), entry);
@@ -498,6 +714,9 @@ pssvm_call_t *pssvm_call_start_obj(pssvm_t *e, const char *entry, const char *co
             return NULL;
         }
         coro = found->coro;
+        if (found->kind == ZBC_ENTRY_ACTION && found->obj)
+            layout = zbc_image_str(&e->img, found->obj);
+        if (found->kind == ZBC_ENTRY_ACTION && len != 0) action = found;
         const char *sig = found->sig ? zbc_image_str(&e->img, found->sig) : NULL;
         has_ret = sig != NULL && strstr(sig, "\"returns\":null") == NULL;
     }
@@ -524,17 +743,29 @@ pssvm_call_t *pssvm_call_start_obj(pssvm_t *e, const char *entry, const char *co
         for (int b = 7; b >= 0; b--) v = (v << 8) | args[i * 8 + (size_t)b];
         h->args[i] = v;
     }
+    if (action != NULL) {
+        char esc[128];
+        json_escape(esc, sizeof(esc), entry);
+        if (action_pins(e, action, h, len / 8, esc) != PSSVM_OK) {
+            free(h);
+            return NULL;
+        }
+    }
     h->spawn_budget = ZBC_SPAWN_LIMIT;
     h->has_ret = has_ret;
     h->state = CALL_READY;
     if (entry != NULL) json_escape(h->call, sizeof(h->call), entry);
     call_host(e, &h->host, &h->yield);
     h->host.cbase = cbase;
+    h->host.pin_slot = h->pin_slot;
+    h->host.pin_val = h->pin_val;
+    h->host.n_pins = h->n_pins;
     h->yield.wait_time = 1;
     h->yield.wait_event = 1;
     h->seed = seed;
     h->obj.slots = slots;
     h->obj.n = n_slots;
+    h->layout = layout;
     h->tb = zsp_timebase_create(&e->alloc, ZSP_TIME_PS);
     /* No inline time skips: a lone thread's WAIT must reach the host too
      * (zsp_timebase_wait skips time itself unless the timebase is running;
@@ -569,17 +800,50 @@ static void ev_notify(zbc_ev_sink_t *s, uint32_t kind, uint32_t id,
     zbc_ev_end(s);
 }
 
+/* A host put on the host-fed channel `id` (its EVENT row): try_put, the
+ * ring as be-bc's _chan_put has it (`buf + (head + count) % depth`). 0, or
+ * -1 (full; the call's error set). Spinning get()s see it on their re-test. */
+static int chan_put(pssvm_call_t *h, uint32_t id, uint64_t value) {
+    pssvm_t *e = h->e;
+    const zbc_evtent *ev = &e->img.events[id];
+    uint64_t *c = e->cobj;
+    if (c[ev->count] >= ev->depth) {
+        char esc[128];
+        const char *p = zbc_image_str(&e->img, ev->path);
+        json_escape(esc, sizeof(esc), p ? p : "?");
+        h->state = CALL_ERROR;
+        h->res.status = ZBC_ERR_UNSUPPORTED_OP;
+        set_err(h->err, PSSVM_ERROR, 0, "host put on full channel %s", esc);
+        return -1;
+    }
+    if (ev->width > 0 && ev->width < 64) {
+        value &= (1ull << ev->width) - 1;
+        if ((ev->flags & 1) && (value >> (ev->width - 1)) & 1)
+            value |= ~((1ull << ev->width) - 1);
+    }
+    c[ev->buf + (c[ev->head] + c[ev->count]) % ev->depth] = value;
+    c[ev->count]++;
+    return 0;
+}
+
 /* Take the engine's notifications into call `h` (host-abi.md "Notify"): an
  * IRQ starts the interrupt handler as a thread of its own in the root
- * component, seeded like the call (pyvm HostCall._irq). A kind with no
- * handler ends the call in ERROR, as pyvm's VMError does. */
+ * component, seeded like the call (pyvm HostCall._irq); a CHAN puts on its
+ * channel. A kind with no handler ends the call in ERROR, as pyvm's VMError
+ * does. */
 static int take_notes(pssvm_call_t *h) {
     pssvm_t *e = h->e;
     uint32_t n = e->n_notes;
     e->n_notes = 0;
     for (uint32_t i = 0; i < n; i++) {
+        int chan = e->notes[i].kind == PSSVM_N_CHAN && e->cobj != NULL
+                   && e->notes[i].id < e->img.event_count;
         ev_notify(h->host.events, e->notes[i].kind, e->notes[i].id, e->notes[i].value,
-                  e->notes[i].kind == PSSVM_N_IRQ && e->irq_coro != 0xFFFFFFFFu);
+                  chan || (e->notes[i].kind == PSSVM_N_IRQ && e->irq_coro != 0xFFFFFFFFu));
+        if (chan) {
+            if (chan_put(h, e->notes[i].id, e->notes[i].value) != 0) return -1;
+            continue;
+        }
         if (e->notes[i].kind == PSSVM_N_IRQ && e->irq_coro != 0xFFFFFFFFu) {
             zsp_timebase_thread_create(
                 h->tb, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
@@ -633,6 +897,10 @@ int pssvm_bind(pssvm_t *e, uint32_t coro, int on) {
 
 int pssvm_notify(pssvm_t *e, uint32_t kind, uint32_t id, uint64_t value) {
     if (e == NULL) return PSSVM_E_ARGS;
+    if (kind == PSSVM_N_CHAN && id >= e->img.event_count) {
+        set_err(e->err, PSSVM_E_ARGS, 0, "no host-fed channel %u", (unsigned)id);
+        return PSSVM_E_ARGS;
+    }
     if (e->n_notes >= PSSVM_NOTES_MAX) {
         set_err(e->err, PSSVM_E_STATE, 0, "more than %d notifications before a run",
                 PSSVM_NOTES_MAX);
@@ -651,14 +919,28 @@ int pssvm_run(pssvm_call_t *h) {
         set_err(h->err, PSSVM_E_STATE, 0, "the call has ended");
         return PSSVM_E_STATE;
     }
+    if (h->noop) {
+        h->state = CALL_DONE;
+        return PSSVM_DONE;
+    }
     /* A WAIT is over: the host has waited, and the engine's time (moved to
      * the timed batch when the WAIT was posted) is now. */
     if (h->yield.state == ZBC_YIELD_WAIT) h->yield.state = ZBC_YIELD_NONE;
     /* Run again while stopped: continue. */
     if (h->yield.state == ZBC_YIELD_STOP) pssvm_dbg_resume(h, PSSVM_RESUME);
     if (h->e->n_notes && take_notes(h) != 0) return PSSVM_ERROR;
-    if (h->yield.state != ZBC_YIELD_PENDING
-            && zbc_drain_until(h->tb, &h->e->img, &h->res, &h->yield) == 0)
+    /* One request outstanding: until it is answered, nothing runs. */
+    h->in_wait_reqs = 0;
+    if (h->yield.state == ZBC_YIELD_PENDING) {
+        if (!h->taken) return PSSVM_REQS;
+        memset(&h->wait_reqs, 0, sizeof(h->wait_reqs));
+        h->wait_reqs.status = PSSVM_WAIT;
+        h->wait_reqs.on = PSSVM_ON_REQS;
+        h->wait_reqs.reg_id = h->wait_reqs.src_ref = 0xFFFFFFFFu;
+        h->in_wait_reqs = 1;
+        return PSSVM_WAIT;
+    }
+    if (zbc_drain_until(h->tb, &h->e->img, &h->res, &h->yield) == 0)
         goto quiet;
     /* Stopped on a request: show it as pssvm_req_t. */
     {
@@ -684,7 +966,13 @@ int pssvm_run(pssvm_call_t *h) {
             return r->status;
         }
         h->res.now = zsp_timebase_current_ticks(h->tb);
-        r->status = y->kind == ZBC_YIELD_ACCESS ? PSSVM_ACCESS : PSSVM_IMPORT;
+        r->status = PSSVM_REQS;
+        r->req_id = ++h->next_req ? h->next_req : ++h->next_req;
+        h->taken = 0;
+        r->api = y->kind == ZBC_YIELD_ACCESS ? PSSVM_API_MEM : PSSVM_API_USER;
+        r->fn = y->kind == ZBC_YIELD_ACCESS ? (uint32_t)y->is_write : y->fn_id;
+        r->thread = zbc_dbg_thread_id(h->e->dbg_on ? &h->e->dbg : NULL, y->thread);
+        r->executor = y->executor;
         r->kind = (uint32_t)y->is_write;
         r->addr = y->addr;
         r->size = y->size;
@@ -698,7 +986,6 @@ int pssvm_run(pssvm_call_t *h) {
         /* The requesting instruction's PROV record (0xFFFFFFFF: none). */
         r->src_ref = y->pc < h->e->img.code_count && h->e->img.code[y->pc].src_ref
                      ? h->e->img.code[y->pc].src_ref : 0xFFFFFFFFu;
-        r->fn_id = y->fn_id;
         r->bound = y->kind == ZBC_YIELD_BOUND ? 1u : 0u;
         r->name = zbc_image_import_name(&h->e->img, y->fn_id);   /* NULL: no IMPORT entry */
         for (uint32_t i = 0; i < y->n_args; i++)
@@ -707,6 +994,7 @@ int pssvm_run(pssvm_call_t *h) {
         r->args_len = 8u * y->n_args;
         r->blocking = (y->flags & ZBC_F_BLOCKING) ? 1u : 0u;
         r->has_ret = (y->flags & ZBC_F_HAS_RET) ? 1u : 0u;
+        r->nret = r->has_ret ? y->n_ret : 0u;
         return r->status;
     }
 quiet:
@@ -752,11 +1040,41 @@ static void set_call_err(pssvm_call_t *h) {
     } else {
         snprintf(loc, sizeof(loc), "\"coro\":null,\"pc\":null");
     }
+    /* An unsat solve: "solve" (its SOLVE index) and "pins" ([[var, value]]). */
+    char solve[1200];
+    solve[0] = 0;
+    if (h->yield.err_solve != 0xFFFFFFFFu) {
+        size_t n = (size_t)snprintf(solve, sizeof(solve), ",\"solve\":%u,\"pins\":[",
+                                    (unsigned)h->yield.err_solve);
+        for (uint32_t i = 0; i < h->yield.err_npin && n + 48 < sizeof(solve); i++)
+            n += (size_t)snprintf(solve + n, sizeof(solve) - n, "%s[%u,%lld]", i ? "," : "",
+                                  (unsigned)h->yield.err_pin_var[i],
+                                  (long long)h->yield.err_pin_val[i]);
+        snprintf(solve + n, sizeof(solve) - n, "]");
+    } else if (h->yield.err_act != 0xFFFFFFFFu) {
+        size_t n = (size_t)snprintf(solve, sizeof(solve), ",\"act\":%u,\"cone\":%u,\"enabled\":[",
+                                    (unsigned)h->yield.err_act, (unsigned)h->yield.err_cone);
+        for (uint32_t i = 0; i < h->yield.err_nen && n + 16 < sizeof(solve); i++)
+            n += (size_t)snprintf(solve + n, sizeof(solve) - n, "%s%u", i ? "," : "",
+                                  (unsigned)h->yield.err_en[i]);
+        n += (size_t)snprintf(solve + n, sizeof(solve) - n, "],\"pins\":[");
+        for (uint32_t i = 0; i < h->yield.err_npin && n + 48 < sizeof(solve); i++)
+            n += (size_t)snprintf(solve + n, sizeof(solve) - n, "%s[%u,%lld]", i ? "," : "",
+                                  (unsigned)h->yield.err_pin_var[i],
+                                  (long long)h->yield.err_pin_val[i]);
+        snprintf(solve + n, sizeof(solve) - n, "]");
+    }
+    /* error()/fatal(): its text, as pyvm says it (F6.11f) */
+    char msg[2 * sizeof(h->yield.err_text)];
+    if (h->yield.err_text[0])
+        json_escape(msg, sizeof(msg), h->yield.err_text);
+    else
+        snprintf(msg, sizeof(msg), "%s (%d)", zbc_status_name(h->res.status), h->res.status);
     snprintf(h->err, PSSVM_ERR_MAX,
-             "{\"message\":\"%s (%d)\",\"status\":%d,\"halted_op\":%d,"
-             "\"call\":\"%s\",%s,%s,\"thread\":null}",
-             zbc_status_name(h->res.status), h->res.status, PSSVM_ERROR,
-             h->res.halted_op, h->call, loc, src);
+             "{\"message\":\"%s\",\"status\":%d,\"halted_op\":%d,"
+             "\"call\":\"%s\",%s,%s,\"thread\":null%s}",
+             msg, PSSVM_ERROR,
+             h->res.halted_op, h->call, loc, src, solve);
 }
 
 int pssvm_dbg_enable(pssvm_t *e, int on) {
@@ -875,30 +1193,46 @@ const pssvm_req_t *pssvm_request(pssvm_call_t *h) {
             || (h->yield.state != ZBC_YIELD_PENDING && h->yield.state != ZBC_YIELD_WAIT
                 && h->yield.state != ZBC_YIELD_STOP))
         return NULL;
+    return h->in_wait_reqs ? &h->wait_reqs : &h->req;
+}
+
+const pssvm_req_t *pssvm_take(pssvm_call_t *h) {
+    if (h == NULL || h->state != CALL_READY || h->yield.state != ZBC_YIELD_PENDING
+            || h->taken)
+        return NULL;
+    h->taken = 1;
     return &h->req;
 }
 
-int pssvm_complete(pssvm_call_t *h, const uint8_t *data, size_t len) {
+int pssvm_complete(pssvm_call_t *h, uint32_t req_id, const uint8_t *data, size_t len) {
     if (h == NULL) return PSSVM_E_ARGS;
     zbc_yield_t *y = &h->yield;
-    if (h->state != CALL_READY || y->state != ZBC_YIELD_PENDING) {
-        set_err(h->err, PSSVM_E_STATE, 0, "no request is pending");
+    if (h->state != CALL_READY || y->state != ZBC_YIELD_PENDING
+            || req_id != h->req.req_id) {
+        set_err(h->err, PSSVM_E_STATE, 0, "request %u is not outstanding", (unsigned)req_id);
         return PSSVM_E_STATE;
     }
     /* A read answers with its data (its size, or a u64); a write with
-     * nothing; an import with its result when it has one (one u64). */
+     * nothing; an import with its result when it has one (one u64, or one
+     * per leaf of a struct result: F6.4b2). */
     size_t want = (y->kind == ZBC_YIELD_ACCESS) ? (y->is_write ? 0 : y->size)
-                : ((y->flags & ZBC_F_HAS_RET) ? 8 : 0);
-    if (len != want && !(want != 0 && len == 8)) {
+                : ((y->flags & ZBC_F_HAS_RET) ? 8u * (y->n_ret ? y->n_ret : 1u) : 0);
+    if (len != want && !(want != 0 && want <= 8 && len == 8)) {
         set_err(h->err, PSSVM_E_STATE, 0, "answer is %u bytes, the request wants %u",
                 (unsigned)len, (unsigned)want);
         return PSSVM_E_STATE;
     }
     if (len && data == NULL) return PSSVM_E_ARGS;
     uint64_t v = 0;
-    for (size_t i = len; i > 0; i--) v = (v << 8) | data[i - 1];
+    for (size_t i = len > 8 ? 8 : len; i > 0; i--) v = (v << 8) | data[i - 1];
     y->value = v;
+    for (size_t k = 0; 8 * k + 8 <= len && k < ZBC_CALL_MAX_ARGS; k++) {
+        uint64_t w = 0;
+        for (int b = 7; b >= 0; b--) w = (w << 8) | data[8 * k + (size_t)b];
+        y->values[k] = w;
+    }
     y->state = ZBC_YIELD_DONE;
+    h->in_wait_reqs = 0;
     /* The asking thread runs next, as if the answer had come inline. */
     zsp_thread_t *t = (zsp_thread_t *)y->thread;
     zsp_timebase_t *tb = h->tb;
@@ -918,6 +1252,45 @@ size_t pssvm_result(pssvm_call_t *h, uint8_t *buf, size_t cap) {
     return 8;
 }
 
+/* The slot of field `name` in an action-object layout ([[name, desc], ...]
+ * in slot order, the ENTRY's obj), or -1. */
+static int64_t layout_slot(const char *p, const char *name) {
+    size_t nl = strlen(name);
+    int64_t n = -1;
+    int depth = 0, first = 0;          /* first: the next string is a name */
+    for (; p && *p; p++) {
+        if (*p == '"') {
+            const char *s = ++p;
+            for (; *p && *p != '"'; p++) if (*p == '\\' && p[1]) p++;
+            if (first && (size_t)(p - s) == nl && !strncmp(s, name, nl)) return n;
+            first = 0;
+            if (!*p) break;
+        }
+        else if (*p == '[' || *p == '{') {
+            if (++depth == 2 && *p == '[') { n++; first = 1; }
+        }
+        else if (*p == ']' || *p == '}') depth--;
+    }
+    return -1;
+}
+
+int pssvm_call_field(pssvm_call_t *h, const char *name, uint64_t *out) {
+    if (h == NULL || name == NULL) return PSSVM_E_ARGS;
+    if (h->state != CALL_DONE) {
+        set_err(h->err, PSSVM_E_STATE, 0, "field '%s' read before the call is done", name);
+        return PSSVM_E_STATE;
+    }
+    int64_t i = h->layout ? layout_slot(h->layout, name) : -1;
+    if (i < 0 || (uint64_t)i >= h->obj.n) {
+        char esc[128];
+        json_escape(esc, sizeof(esc), name);
+        set_err(h->err, PSSVM_E_ARGS, 0, "no field '%s' in the call's action object", esc);
+        return PSSVM_E_ARGS;
+    }
+    if (out) *out = h->obj.slots[i];
+    return PSSVM_OK;
+}
+
 int pssvm_call_status(pssvm_call_t *h, int *halted_op, uint64_t *now) {
     if (h == NULL) return PSSVM_E_ARGS;
     if (halted_op) *halted_op = h->res.halted_op;
@@ -927,7 +1300,9 @@ int pssvm_call_status(pssvm_call_t *h, int *halted_op, uint64_t *now) {
 
 void pssvm_call_end(pssvm_call_t *h) {
     if (h == NULL) return;
-    zsp_timebase_destroy(h->tb);   /* drops threads that never finished */
+    if (h->tb != NULL)
+        zsp_timebase_destroy(h->tb);   /* drops threads that never finished */
+    free(h->own_slots);
     free(h);
 }
 
@@ -939,6 +1314,7 @@ const char *pssvm_error(pssvm_t *e, pssvm_call_t *h) {
 
 void pssvm_free(pssvm_t *e) {
     if (e == NULL) return;
+    zbc_files_close_all();
     free(e->bound);
     free(e->cobj);
     free(e->data);

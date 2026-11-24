@@ -32,14 +32,18 @@ _U64 = {"kind": "int", "width": 64, "signed": False}
 class PssvmReq(ctypes.Structure):
     """Mirror of pssvm_req_t."""
     _fields_ = [
-        ("status", ctypes.c_int32), ("kind", ctypes.c_uint32),
+        ("status", ctypes.c_int32), ("req_id", ctypes.c_uint32),
+        ("api", ctypes.c_uint32), ("fn", ctypes.c_uint32),
+        ("thread", ctypes.c_uint32), ("executor", ctypes.c_uint32),
+        ("kind", ctypes.c_uint32),
         ("addr", ctypes.c_uint64), ("size", ctypes.c_uint32),
         ("data", ctypes.c_uint64), ("reg_id", ctypes.c_uint32),
-        ("src_ref", ctypes.c_uint32), ("fn_id", ctypes.c_uint32),
+        ("src_ref", ctypes.c_uint32),
         ("name", ctypes.c_char_p), ("args", ctypes.POINTER(ctypes.c_uint8)),
         ("args_len", ctypes.c_size_t), ("blocking", ctypes.c_uint32),
         ("has_ret", ctypes.c_uint32), ("on", ctypes.c_uint32),
         ("delay", ctypes.c_uint64), ("bound", ctypes.c_uint32),
+        ("nret", ctypes.c_uint32),
     ]
 
 
@@ -61,7 +65,8 @@ def vm(_rawlib):
         "pssvm_call_status": ([vp, ctypes.POINTER(ctypes.c_int),
                                ctypes.POINTER(ctypes.c_uint64)], ctypes.c_int),
         "pssvm_request": ([vp], ctypes.POINTER(PssvmReq)),
-        "pssvm_complete": ([vp, u8p, sz], ctypes.c_int),
+        "pssvm_take": ([vp], ctypes.POINTER(PssvmReq)),
+        "pssvm_complete": ([vp, ctypes.c_uint32, u8p, sz], ctypes.c_int),
     }
     for name, (args, res) in sigs.items():
         fn = getattr(lib, name)
@@ -90,8 +95,8 @@ def _load(vm, model):
     return e
 
 
-def test_the_abi_version_is_1(vm):
-    assert vm.pssvm_abi_version() == 1
+def test_the_abi_version_is_2(vm):
+    assert vm.pssvm_abi_version() == 2
 
 
 @pytest.mark.parametrize("model", [_fact(5), _fact(12), _counter()],
@@ -182,6 +187,20 @@ def test_a_bad_image_is_null_with_an_error(vm, data):
     assert err["message"].startswith("bad image")
 
 
+def test_an_image_with_heap_ops_is_refused_naming_the_heap(vm):
+    # F6.9c (be-bc heap.md s.9): the C engine has no heap until M14; the
+    # refusal comes before anything runs and says what is missing.
+    from zuspec.be.bc.model import CoroDescriptor, heap_imm, HEAP_SIZE
+    model = ZbcModel(coros=[CoroDescriptor(name="main", blocks=[], code=[
+        Instr(Op.HEAP, args=(0, 0, 0), imm=heap_imm(HEAP_SIZE, 0, 0, 0)),
+        Instr(Op.RET, args=(0,))])], entry_coro=0)
+    e = _load(vm, model)
+    assert vm.pssvm_construct(e, None, None, 0) == PSSVM_E_IMAGE
+    err = json.loads(vm.pssvm_error(e, None))
+    assert err["halted_op"] == int(Op.HEAP)
+    assert "heap ops" in err["message"] and "C engine" in err["message"]
+    vm.pssvm_free(e)
+
 def test_a_debug_image_with_identity_and_entries_loads(vm):
     model = _with_fact_entry(4)
     model.profile = "debug"
@@ -193,7 +212,9 @@ def test_a_debug_image_with_identity_and_entries_loads(vm):
 
 # --- P4.3b: bus accesses and imports yield to the host ----------------------
 
-PSSVM_ACCESS, PSSVM_IMPORT, PSSVM_E_STATE = 1, 2, -2
+PSSVM_REQS, PSSVM_WAIT, PSSVM_E_STATE = 1, 3, -2
+PSSVM_API_MEM, PSSVM_API_USER = 0, 16
+PSSVM_ON_REQS = 3
 _VOID = 0xFFFFFFFF
 
 
@@ -203,12 +224,25 @@ def _code_model(code):
                                           frame_locals=[])], entry_coro=0)
 
 
+def _args(r):
+    return struct.unpack("<%dQ" % (r.args_len // 8), bytes(r.args[:r.args_len]))
+
+
 def _req(vm, h):
+    """What a WAIT or STOP waits on (pssvm_request)."""
     r = vm.pssvm_request(h)
     assert r, "no request"
     r = r.contents
-    args = struct.unpack("<%dQ" % (r.args_len // 8), bytes(r.args[:r.args_len]))
-    return r, args
+    return r, _args(r)
+
+
+def _take(vm, h):
+    """The new request after a REQS (pssvm_take; taken once)."""
+    r = vm.pssvm_take(h)
+    assert r, "no request"
+    r = r.contents
+    assert vm.pssvm_take(h) is None or not vm.pssvm_take(h)
+    return r, _args(r)
 
 
 def test_an_import_stops_the_run_until_the_host_answers(vm):
@@ -219,13 +253,19 @@ def test_an_import_stops_the_run_until_the_host_answers(vm):
         Instr(Op.ADD, args=(4, 3, 1)), Instr(Op.RET, args=(4,))]))
     h = vm.pssvm_call_start(e, b"", b"", None, 0, 0)
     assert vm.pssvm_request(h) is None or not vm.pssvm_request(h)
-    assert vm.pssvm_run(h) == PSSVM_IMPORT
-    r, args = _req(vm, h)
-    assert (r.status, r.fn_id, args, r.blocking, r.has_ret) == (PSSVM_IMPORT, 42, (5, 7), 1, 1)
-    assert vm.pssvm_run(h) == PSSVM_IMPORT          # unanswered: still waiting
-    assert vm.pssvm_complete(h, b"", 0) == PSSVM_E_STATE   # wants 8 bytes
-    assert vm.pssvm_complete(h, struct.pack("<Q", 100), 8) == 0
-    assert vm.pssvm_complete(h, struct.pack("<Q", 100), 8) == PSSVM_E_STATE
+    assert vm.pssvm_take(h) is None or not vm.pssvm_take(h)
+    assert vm.pssvm_run(h) == PSSVM_REQS
+    assert vm.pssvm_run(h) == PSSVM_REQS            # untaken: still new
+    r, args = _take(vm, h)
+    assert (r.status, r.api, r.fn, args, r.blocking, r.has_ret) == \
+        (PSSVM_REQS, PSSVM_API_USER, 42, (5, 7), 1, 1)
+    rid = r.req_id
+    assert vm.pssvm_run(h) == PSSVM_WAIT            # taken, unanswered: waits on it
+    assert _req(vm, h)[0].on == PSSVM_ON_REQS
+    assert vm.pssvm_complete(h, rid, b"", 0) == PSSVM_E_STATE   # wants 8 bytes
+    assert vm.pssvm_complete(h, rid + 1, struct.pack("<Q", 100), 8) == PSSVM_E_STATE
+    assert vm.pssvm_complete(h, rid, struct.pack("<Q", 100), 8) == 0
+    assert vm.pssvm_complete(h, rid, struct.pack("<Q", 100), 8) == PSSVM_E_STATE
     assert vm.pssvm_run(h) == PSSVM_DONE
     buf = (ctypes.c_uint8 * 8)()
     assert vm.pssvm_result(h, buf, 8) == 8
@@ -242,15 +282,15 @@ def test_bus_writes_and_reads_stop_the_run_with_their_access(vm):
         Instr(Op.IMPORT, args=(BUILTIN_READ[32], 3, 1), flags=INSTR_F_HAS_RET),
         Instr(Op.RET, args=(3,))]))
     h = vm.pssvm_call_start(e, b"", b"", None, 0, 0)
-    assert vm.pssvm_run(h) == PSSVM_ACCESS
-    r, _ = _req(vm, h)
-    assert (r.kind, r.addr, r.size, r.data) == (1, 0x1000, 2, 0xABCD)
-    assert vm.pssvm_complete(h, struct.pack("<Q", 1), 8) == PSSVM_E_STATE  # a write takes nothing
-    assert vm.pssvm_complete(h, None, 0) == 0
-    assert vm.pssvm_run(h) == PSSVM_ACCESS
-    r, _ = _req(vm, h)
-    assert (r.kind, r.addr, r.size) == (0, 0x1000, 4)
-    assert vm.pssvm_complete(h, struct.pack("<I", 0xFEEDF00D), 4) == 0
+    assert vm.pssvm_run(h) == PSSVM_REQS
+    r, _ = _take(vm, h)
+    assert (r.api, r.fn, r.kind, r.addr, r.size, r.data) == (PSSVM_API_MEM, 1, 1, 0x1000, 2, 0xABCD)
+    assert vm.pssvm_complete(h, r.req_id, struct.pack("<Q", 1), 8) == PSSVM_E_STATE  # a write takes nothing
+    assert vm.pssvm_complete(h, r.req_id, None, 0) == 0
+    assert vm.pssvm_run(h) == PSSVM_REQS
+    r, _ = _take(vm, h)
+    assert (r.api, r.fn, r.kind, r.addr, r.size) == (PSSVM_API_MEM, 0, 0, 0x1000, 4)
+    assert vm.pssvm_complete(h, r.req_id, struct.pack("<I", 0xFEEDF00D), 4) == 0
     assert vm.pssvm_run(h) == PSSVM_DONE
     buf = (ctypes.c_uint8 * 8)()
     vm.pssvm_result(h, buf, 8)
@@ -262,9 +302,9 @@ def test_bus_writes_and_reads_stop_the_run_with_their_access(vm):
 def test_completing_with_nothing_pending_is_a_state_error(vm):
     e = _load(vm, _fact(3))
     h = vm.pssvm_call_start(e, b"", b"", None, 0, 0)
-    assert vm.pssvm_complete(h, None, 0) == PSSVM_E_STATE
+    assert vm.pssvm_complete(h, 0, None, 0) == PSSVM_E_STATE
     assert vm.pssvm_run(h) == PSSVM_DONE
-    assert vm.pssvm_complete(h, None, 0) == PSSVM_E_STATE
+    assert vm.pssvm_complete(h, 0, None, 0) == PSSVM_E_STATE
     vm.pssvm_call_end(h)
     vm.pssvm_free(e)
 
@@ -273,11 +313,12 @@ def test_a_call_ended_while_it_waits_is_dropped(vm):
     e = _load(vm, _code_model([
         C(1, 9), Instr(Op.IMPORT, args=(7, _VOID, 1)), Instr(Op.RET, args=(1,))]))
     h = vm.pssvm_call_start(e, b"", b"", None, 0, 0)
-    assert vm.pssvm_run(h) == PSSVM_IMPORT
+    assert vm.pssvm_run(h) == PSSVM_REQS
     vm.pssvm_call_end(h)
     h = vm.pssvm_call_start(e, b"", b"", None, 0, 0)
-    assert vm.pssvm_run(h) == PSSVM_IMPORT
-    assert vm.pssvm_complete(h, None, 0) == 0
+    assert vm.pssvm_run(h) == PSSVM_REQS
+    r, _ = _take(vm, h)
+    assert vm.pssvm_complete(h, r.req_id, None, 0) == 0
     assert vm.pssvm_run(h) == PSSVM_DONE
     vm.pssvm_call_end(h)
     vm.pssvm_free(e)
@@ -298,10 +339,11 @@ def test_spawned_threads_ask_one_at_a_time_in_scheduling_order(vm):
                                   for n, c in coros], entry_coro=0))
     h = vm.pssvm_call_start(e, b"", b"", None, 0, 0)
     seen = []
-    while (st := vm.pssvm_run(h)) == PSSVM_IMPORT:
-        r, args = _req(vm, h)
-        seen.append((r.fn_id, args))
-        assert vm.pssvm_complete(h, None, 0) == 0
+    while (st := vm.pssvm_run(h)) == PSSVM_REQS:
+        r, args = _take(vm, h)
+        assert r.api == PSSVM_API_USER
+        seen.append((r.fn, args))
+        assert vm.pssvm_complete(h, r.req_id, None, 0) == 0
     assert st == PSSVM_DONE
     assert seen == [(1, (100,)), (3, (100,)), (2, (200,))]
     vm.pssvm_call_end(h)
@@ -310,7 +352,7 @@ def test_spawned_threads_ask_one_at_a_time_in_scheduling_order(vm):
 
 # --- P4.3c: a call waits on time through the host ----------------------------
 
-PSSVM_WAIT, PSSVM_ON_TIME = 3, 1
+PSSVM_ON_TIME = 1
 
 
 def _waits(vm, h):
@@ -319,7 +361,7 @@ def _waits(vm, h):
     while (st := vm.pssvm_run(h)) == PSSVM_WAIT:
         r, _ = _req(vm, h)
         assert (r.status, r.on) == (PSSVM_WAIT, PSSVM_ON_TIME)
-        assert vm.pssvm_complete(h, None, 0) == PSSVM_E_STATE   # a WAIT takes no answer
+        assert vm.pssvm_complete(h, r.req_id, None, 0) == PSSVM_E_STATE   # a WAIT takes no answer
         delays.append(r.delay)
     return st, delays
 
@@ -349,8 +391,10 @@ def test_parallel_waits_give_the_gaps_between_wake_times(vm, eng):
     e = _load(vm, model)
     h = vm.pssvm_call_start(e, b"", b"", None, 0, 0)
     assert vm.pssvm_run(h) == PSSVM_WAIT and _req(vm, h)[0].delay == 4
-    assert vm.pssvm_run(h) == PSSVM_IMPORT              # A, woken at 4
-    assert vm.pssvm_complete(h, None, 0) == 0
+    assert vm.pssvm_run(h) == PSSVM_REQS                # A, woken at 4
+    r, _ = _take(vm, h)
+    assert (r.api, r.fn) == (PSSVM_API_USER, 1)
+    assert vm.pssvm_complete(h, r.req_id, None, 0) == 0
     assert vm.pssvm_run(h) == PSSVM_WAIT and _req(vm, h)[0].delay == 5
     assert vm.pssvm_run(h) == PSSVM_DONE
     halted, now = ctypes.c_int(), ctypes.c_uint64()

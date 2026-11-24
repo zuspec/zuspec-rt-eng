@@ -112,18 +112,50 @@ def test_the_call_reports_each_request_like_hostcall(_rawlib):
         call = eng.call()
         seen = []
         while (r := call.run()).status != nhost.DONE:
-            seen.append((r.status_name, r.kind, r.fn_id, r.on, r.delay))
-            if r.status == nhost.ACCESS:
-                with pytest.raises(nhost.HostStateError):
-                    call.run()                    # unanswered
-                call.complete(0xBEEF if r.kind == "r" else None)
-            elif r.status == nhost.IMPORT:
-                call.complete(1 if r.has_ret else None)
+            if r.status != nhost.REQS:
+                seen.append((r.status_name, None, "", 0, r.on, r.delay))
+                continue
+            q = call.take()
+            assert call.take() is None            # one request at a time
+            seen.append((q.status_name, q.api, q.kind, q.fn, q.on, q.delay))
+            if q.api == nhost.API_MEM:
+                w = call.run()                    # taken, unanswered: waits on it
+                assert (w.status, w.on) == (nhost.WAIT, "REQS")
+                call.complete(q.req_id, 0xBEEF if q.kind == "r" else None)
+            else:
+                call.complete(q.req_id, 1 if q.has_ret else None)
         assert call.result == 1 and call.over
         call.end()
-    assert seen == [("ACCESS", "w", 0, "", 0), ("ACCESS", "r", 0, "", 0),
-                    ("IMPORT", "", 42, "", 0), ("WAIT", "", 0, "TIME", 5),
-                    ("IMPORT", "", 7, "", 0)]
+    M, U = nhost.API_MEM, nhost.API_USER
+    assert seen == [("REQS", M, "w", nhost.FN_WRITE, "", 0),
+                    ("REQS", M, "r", nhost.FN_READ, "", 0),
+                    ("REQS", U, "", 42, "", 0), ("WAIT", None, "", 0, "TIME", 5),
+                    ("REQS", U, "", 7, "", 0)]
+
+
+def test_a_taken_request_waits_until_it_is_answered_by_its_id(_rawlib):
+    code = [C(1, 5), Instr(Op.IMPORT, args=(42, 2, 1),
+                           flags=INSTR_F_BLOCKING | INSTR_F_HAS_RET),
+            Instr(Op.RET, args=(2,))]
+    with nhost.Engine(_rawlib, _code_model(code).to_bytes()) as eng:
+        call = eng.call()
+        assert call.run().status == nhost.REQS
+        q = call.take()
+        assert (q.api, q.fn, q.args) == (nhost.API_USER, 42, [5])
+        assert call.take() is None
+        for _ in range(2):                         # taken, unanswered
+            r = call.run()
+            assert (r.status, r.on) == (nhost.WAIT, "REQS")
+        with pytest.raises(nhost.HostStateError):
+            call.complete(q.req_id + 1, 7)         # not outstanding
+        with pytest.raises(nhost.HostStateError):
+            call.fail(q.req_id + 1, ValueError())
+        call.complete(q.req_id, 1005)
+        with pytest.raises(nhost.HostStateError):
+            call.complete(q.req_id, 1005)          # answered already
+        assert call.run().status == nhost.DONE
+        assert call.result == 1005
+        call.end()
 
 
 def test_a_bad_image_or_entry_is_a_native_error(_rawlib):
@@ -198,10 +230,12 @@ def test_an_irq_without_a_handler_or_a_bad_handler_is_an_error(_rawlib):
             eng.set_irq("nope")
         call = eng.call()
         assert call.run().status_name == "WAIT"
-        call.notify(nhost.N_CHAN, 1, 9)
+        with pytest.raises(nhost.HostStateError, match="no host-fed channel 1"):
+            call.notify(nhost.N_CHAN, 1, 9)    # F5.5b: no EVENT row 1
+        call.notify(7, 1, 9)
         r = call.run()
         assert r.status_name == "ERROR"
-        assert "notify kind 2 has no handler" in r.error["message"]
+        assert "notify kind 7 has no handler" in r.error["message"]
         call.end()
 
 
@@ -260,7 +294,7 @@ def test_both_engines_record_the_same_platform_side(_rawlib):
 def test_a_notification_with_no_handler_is_recorded_undelivered(_rawlib):
     def drive(call):
         assert call.run().status_name == "WAIT"
-        call.notify(nhost.N_CHAN, 1, 9)
+        call.notify(7, 1, 9)
         try:
             call.run()
         except Exception:   # noqa: BLE001 - pyvm raises, C returns ERROR
@@ -268,7 +302,7 @@ def test_a_notification_with_no_handler_is_recorded_undelivered(_rawlib):
         call.end()
     sides = [_platform(e, _rawlib, _irq_model(), drive) for e in ("py", "c")]
     assert sides[0] == sides[1] == [
-        ("notify", {"chan": 1, "value": 9, "delivered": False})]
+        ("notify", {"kind": 7, "value": 9, "delivered": False})]
 
 
 def test_an_action_entry_reads_and_writes_its_own_object(_rawlib):

@@ -3,6 +3,7 @@
  * fatal(), the C twin of zuspec-be-bc interp/fmt.py `format_message`: the
  * same output for the same entry and values, or an error where it raises.
  */
+#include <stdio.h>
 #include <string.h>
 #include "zbc_interp.h"
 
@@ -94,6 +95,25 @@ static void render_text(buf_t *b, const spec_t *sp, const char *s) {
 }
 
 /* Parse the specifier at fmt[i] == '%'. Returns the index past it, or -1. */
+/* A float (F6.6: the register holds its binary64 bits) by C printf with the
+ * spec's flags, width and precision, as the Python VM's %-formatting does.
+ * A NaN prints as "nan" whatever its sign bit, as Python prints it. */
+static void render_float(buf_t *b, const spec_t *sp, uint64_t bits) {
+    double d;
+    char f[48], txt[512];
+    if ((bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull
+            && (bits & 0x000FFFFFFFFFFFFFull))
+        bits &= 0x7FFFFFFFFFFFFFFFull;
+    memcpy(&d, &bits, sizeof d);
+    int n = snprintf(f, sizeof f, "%%%.*s", (int)(sp->n_flags > 8 ? 8 : sp->n_flags), sp->flags);
+    if (sp->width > 0) n += snprintf(f + n, sizeof f - n, "%d", sp->width > 400 ? 400 : sp->width);
+    if (sp->prec >= 0) n += snprintf(f + n, sizeof f - n, ".%d", sp->prec > 400 ? 400 : sp->prec);
+    snprintf(f + n, sizeof f - n, "%c", sp->conv);
+    int len = snprintf(txt, sizeof txt, f, d);
+    if (len < 0) return;
+    put(b, txt, (uint32_t)(len >= (int)sizeof txt ? (int)sizeof txt - 1 : len));
+}
+
 static int parse_spec(const char *fmt, int i, spec_t *sp) {
     int j = i + 1;
     sp->flags = fmt + j;
@@ -110,7 +130,7 @@ static int parse_spec(const char *fmt, int i, spec_t *sp) {
         sp->prec = 0;
         while (fmt[j] >= '0' && fmt[j] <= '9') sp->prec = sp->prec * 10 + (fmt[j++] - '0');
     }
-    if (!fmt[j] || !strchr("duxXobBns%", fmt[j])) return -1;
+    if (!fmt[j] || !strchr("duxXobBnseEfgG%", fmt[j])) return -1;
     sp->conv = fmt[j];
     if (sp->conv == '%' && (sp->n_flags || sp->width >= 0 || sp->prec >= 0)) return -1;
     return j + 1;
@@ -139,8 +159,11 @@ int zbc_format_message(const zbc_image_t *img, uint32_t msg_idx,
         const zbc_msgarg *a = &img->msgargs[m->arg0 + arg];
         uint64_t v = locals[img->msgslots[m->slot0 + 1 + arg]];
         arg++;
-        if (strchr("duxXobB", sp.conv)) {
-            if (a->kind == ZBC_MSG_STRING) return -1;
+        if (strchr("eEfgG", sp.conv)) {
+            if (a->kind != ZBC_MSG_FLOAT) return -1;
+            render_float(&b, &sp, v);
+        } else if (strchr("duxXobB", sp.conv)) {
+            if (a->kind == ZBC_MSG_STRING || a->kind == ZBC_MSG_FLOAT) return -1;
             if (a->kind == ZBC_MSG_BOOL) render_int(&b, &sp, v ? 1 : 0, 32);
             else render_int(&b, &sp, v, a->width);
         } else if (sp.conv == 'n') {

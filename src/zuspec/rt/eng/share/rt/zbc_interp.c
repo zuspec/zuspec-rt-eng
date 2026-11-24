@@ -7,6 +7,8 @@
  * same suspend/resume protocol as a compiled coroutine (save pc -> wait -> return
  * leaf). Orchestration beyond WAIT/YIELD, fields, and the const pool land later.
  */
+#include <math.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +32,7 @@ static uint64_t lcg_next(uint64_t s) {
 /* Child stream seed for the index-th SPAWN/INVOKE/SELECT child of a frame. Depends
  * on the parent's *current* state at the fork point (the parent state is unchanged
  * by forking -- only an explicit draw advances it). */
-static uint64_t fork_seed(uint64_t parent_state, uint32_t index) {
+static uint64_t fork_seed(uint64_t parent_state, uint64_t index) {
     return lcg_next(parent_state ^ ((uint64_t)index * ZBC_FORK_MIX));
 }
 
@@ -50,6 +52,7 @@ typedef struct interp_locals_s {
     uint32_t           comp;
     struct zbc_actrun_s *ar;      /* P4.10d: act's run state (NULL: none) */
     int                is_node;   /* P4.10d3: runs a node (root or a traversal) */
+    int                is_entry;  /* the run's root frame (host pins apply, F2.3b) */
     uint32_t           pc;
     uint32_t           resume_pc; /* pc this run of the frame started at (SPIN progress test) */
     uint64_t           steps;     /* remaining step budget (frame-resident) */
@@ -73,16 +76,35 @@ typedef struct interp_locals_s {
      * fork_seed(seed_state, child_index++) and hands the child its own stream. */
     uint64_t               seed_state;
     uint32_t               child_index;
+    /* Keyed seeds (host->seed_stream 0): the seed this frame was created with,
+     * and how many children of each seed key it has forked (key_n pairs). */
+    uint64_t               origin;
+    uint64_t              *key_cnt;    /* [2*i] key, [2*i+1] count; malloc'd */
+    uint32_t               key_n, key_cap;
     /* CALL (B-D5): arguments staged for the next call, this frame's own, and
      * its call depth. */
     uint32_t               depth;
     uint64_t               staged[ZBC_CALL_MAX_ARGS];
     uint64_t               call_args[ZBC_CALL_MAX_ARGS];
     uint32_t               n_staged;   /* ARGs staged since the last CALL */
+    /* F6.4a: what the last CALL's callee staged before its RET (LD_RES), and
+     * whether this frame is a CALL's callee (its RET hands them back). */
+    uint64_t               results[ZBC_CALL_MAX_ARGS];
+    int                    called;
+    /* Procedural randomize (F3.7c): inputs SOLVE_PIN staged for the next
+     * SOLVE, and the last procedural SOLVE's values for SOLVE_GET. */
+    uint32_t               n_pins;
+    uint32_t               pin_var[ZBC_SOLVE_MAX_INPUTS];
+    int64_t                pin_val[ZBC_SOLVE_MAX_INPUTS];
+    uint32_t               n_solved;   /* 0: no procedural SOLVE yet */
+    uint64_t               solved[ZBC_SOLVE_MAX_VARS];
     /* Events (P4.4c): this frame's id (the Python VM's Frame.id) and a pc
      * whose stmt events are already out (an IMPORT re-run after its answer). */
     uint32_t               ev_id;
     uint32_t               ev_skip_pc;
+    /* F5.4a: the executor (EXEC row; 0xFFFFFFFF: none) this frame's
+     * requests carry; set by EXEC_SET, inherited from the parent frame. */
+    uint32_t               executor;
     /* Debugging (P4.5a): this frame's id, and the pc whose debug check is
      * done (a re-entry there -- resume, IMPORT answer, wait -- skips it). */
     uint32_t               dbg_id;
@@ -100,6 +122,33 @@ typedef struct interp_locals_s {
     uint64_t          *locals;
     uint64_t           slots[];
 } interp_locals_t;
+
+/* The seed of a child coroutine `target` this frame starts (SPAWN, INVOKE,
+ * SELECT branch). By position: fork_seed(seed_state, child_index++). Keyed
+ * (host->seed_stream 0, F3.9; be-bc determinism.keyed_index): from the frame's
+ * creation seed by the child's seed key and how many children with that key
+ * it forked before, so adding an unrelated traversal moves no other seed. */
+static uint64_t child_seed(interp_locals_t *L, uint32_t target) {
+    if ((L->host && L->host->seed_stream) || !L->img->seed_keys)
+        return fork_seed(L->seed_state, L->child_index++);
+    uint64_t key = L->img->seed_keys[target], n = 0;
+    uint32_t i = 0;
+    while (i < L->key_n && L->key_cnt[2 * i] != key) i++;
+    if (i == L->key_n) {
+        if (L->key_n == L->key_cap) {
+            uint32_t cap = L->key_cap ? 2 * L->key_cap : 4;
+            uint64_t *kc = (uint64_t *)realloc(L->key_cnt, 16u * cap);
+            if (!kc) return fork_seed(L->seed_state, L->child_index++);
+            L->key_cnt = kc;
+            L->key_cap = cap;
+        }
+        L->key_cnt[2 * i] = key;
+        L->key_cnt[2 * i + 1] = 0;
+        L->key_n++;
+    }
+    n = L->key_cnt[2 * i + 1]++;
+    return fork_seed(L->origin, lcg_next(key ^ ((n + 1) * ZBC_LCG_MUL)));
+}
 
 /* The events sink of L's run and L's coroutine's mask, or 0. */
 static inline uint32_t ev_mask(const interp_locals_t *L) {
@@ -205,12 +254,12 @@ static int verify_coro(const zbc_instr *code, uint32_t n,
         switch (in->op) {
         case ZBC_OP_CONST: case ZBC_OP_LD_FIELD: case ZBC_OP_ST_FIELD:
         case ZBC_OP_LD_COMP: case ZBC_OP_ST_COMP: case ZBC_OP_BRZ:
-        case ZBC_OP_ARG: case ZBC_OP_LD_ARG:
+        case ZBC_OP_ARG: case ZBC_OP_LD_ARG: case ZBC_OP_LD_RES:
             USE_R(a0); break;
         case ZBC_OP_WAIT: case ZBC_OP_RET:
             if (in->nargs > 0) USE_R(a0);
             break;
-        case ZBC_OP_MOV: case ZBC_OP_NEG: case ZBC_OP_NOT:
+        case ZBC_OP_MOV: case ZBC_OP_NEG: case ZBC_OP_NOT: case ZBC_OP_FCVT:
             USE_R(a0); USE_R(a1); break;
         case ZBC_OP_LD_LOCAL: case ZBC_OP_ST_LOCAL:
             USE_R(a0);
@@ -221,10 +270,16 @@ static int verify_coro(const zbc_instr *code, uint32_t n,
         case ZBC_OP_SHL: case ZBC_OP_SHR:
         case ZBC_OP_CMP_EQ: case ZBC_OP_CMP_NE: case ZBC_OP_CMP_LT:
         case ZBC_OP_CMP_LE: case ZBC_OP_CMP_GT: case ZBC_OP_CMP_GE:
+        case ZBC_OP_FARITH: case ZBC_OP_FCMP: case ZBC_OP_FMATH:
             USE_R(a0); USE_R(a1); USE_R(a2); break;
         case ZBC_OP_CALL:
             if (a1 != 0xFFFFFFFFu) USE_R(a1);
             break;
+        case ZBC_OP_SOLVE_PIN:
+            USE_R(a1); break;
+        case ZBC_OP_SOLVE_GET:
+        case ZBC_OP_EXEC_GET:
+            USE_R(a0); break;
         case ZBC_OP_INVOKE:
             if (in->flags & ZBC_F_HAS_RET) USE_R(a1);
             break;
@@ -244,7 +299,7 @@ static int verify_coro(const zbc_instr *code, uint32_t n,
         case ZBC_OP_WAIT: case ZBC_OP_RET:
             if (in->nargs > 0 && a0 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
             break;
-        case ZBC_OP_MOV: case ZBC_OP_NEG: case ZBC_OP_NOT:
+        case ZBC_OP_MOV: case ZBC_OP_NEG: case ZBC_OP_NOT: case ZBC_OP_FCVT:
             if (a0 >= ZBC_MAX_REGS || a1 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
             break;
         case ZBC_OP_LD_LOCAL: case ZBC_OP_ST_LOCAL:
@@ -261,6 +316,7 @@ static int verify_coro(const zbc_instr *code, uint32_t n,
         case ZBC_OP_SHL: case ZBC_OP_SHR:
         case ZBC_OP_CMP_EQ: case ZBC_OP_CMP_NE: case ZBC_OP_CMP_LT:
         case ZBC_OP_CMP_LE: case ZBC_OP_CMP_GT: case ZBC_OP_CMP_GE:
+        case ZBC_OP_FARITH: case ZBC_OP_FCMP: case ZBC_OP_FMATH:
             if (a0 >= ZBC_MAX_REGS || a1 >= ZBC_MAX_REGS || a2 >= ZBC_MAX_REGS)
                 return ZBC_ERR_OOB_REG;
             break;
@@ -273,13 +329,20 @@ static int verify_coro(const zbc_instr *code, uint32_t n,
             if (a0 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
             if (a1 > n) return ZBC_ERR_BAD_TARGET;
             break;
-        case ZBC_OP_ARG: case ZBC_OP_LD_ARG:
+        case ZBC_OP_ARG: case ZBC_OP_LD_ARG: case ZBC_OP_LD_RES:
             if (a0 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
             if (a1 >= ZBC_CALL_MAX_ARGS) return ZBC_ERR_OOB_LOCAL;
             break;
         case ZBC_OP_CALL:
             /* arg0 is a coro index (runtime-checked); arg1 the result reg. */
             if (a1 != 0xFFFFFFFFu && a1 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
+            break;
+        case ZBC_OP_SOLVE_PIN:
+            if (a1 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
+            break;
+        case ZBC_OP_SOLVE_GET:
+        case ZBC_OP_EXEC_GET:
+            if (a0 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
             break;
         case ZBC_OP_INVOKE:
             /* arg0 is a coro index (runtime-checked); arg1 is the result reg. */
@@ -292,6 +355,11 @@ static int verify_coro(const zbc_instr *code, uint32_t n,
                 return ZBC_ERR_OOB_REG;
             if (in->nargs > 2 && a2 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
             if (in->nargs > 3 && in->arg3 >= ZBC_MAX_REGS) return ZBC_ERR_OOB_REG;
+            /* imm bits 0-7 = n > 0: the n arguments were staged by ARG
+             * (F6.5b); bits 8-15: the struct result's leaves (F6.4b2). */
+            if ((in->imm & 0xFF) > ZBC_IMPORT_MAX_ARGS
+                    || ((in->imm >> 8) & 0xFF) > ZBC_CALL_MAX_ARGS
+                    || (in->imm >> 16) != 0) return ZBC_ERR_OOB_LOCAL;
             break;
         default:
             break;   /* NOP, YIELD, and (as-yet) unsupported ops: no operands to check here */
@@ -497,6 +565,13 @@ static void dbg_fill(const zbc_dbg_t *d, const interp_locals_t *L, zbc_dbg_frame
     o->thread = t;
 }
 
+uint32_t zbc_dbg_thread_id(const zbc_dbg_t *d, const void *thread) {
+    if (d == NULL) return 0;
+    for (const interp_locals_t *L = (const interp_locals_t *)d->frames; L; L = L->dbg_next)
+        if (dbg_is_bottom(L) && (const void *)L->self_thread == thread) return L->dbg_id;
+    return 0;
+}
+
 uint32_t zbc_dbg_threads(const zbc_dbg_t *d, uint32_t *ids, uint32_t cap) {
     uint32_t n = 0;
     for (const interp_locals_t *L = (const interp_locals_t *)d->frames; L; L = L->dbg_next) {
@@ -545,6 +620,8 @@ uint32_t zbc_dbg_frames(const zbc_dbg_t *d, uint32_t thread_id, zbc_dbg_frame_t 
 /* zbc_actscope.kind (ScopeKind order) */
 #define ACT_KIND_PARALLEL 2u
 #define ACT_KIND_SCHEDULE 3u
+#define ACT_KIND_SELECT_BRANCH 5u   /* .. IF_THEN, IF_ELSE, MATCH_CASE, */
+#define ACT_KIND_LOOP_BODY 9u       /* LOOP_BODY: the committing kinds */
 
 /* The run state of one activation (P4.10d), as pyvm's Activation: per node
  * committed / started / the site it was traversed through, per site fired,
@@ -585,7 +662,29 @@ typedef struct zbc_actrun_s {
                        uint64_t *fp; } *par;
     uint32_t  n_par;
     uint8_t   has_par;
+    /* pyvm Activation.attr_held / attr_claimed (F8.6e): the slots of
+     * resource attributes (actvar flag 16) a solve chose and holds, and
+     * those a claim has fixed. */
+    struct act_slots_s { uint32_t *s; uint32_t n, cap; } attr_held, attr_claimed;
 } zbc_actrun_t;
+
+static int act_slots_has(const struct act_slots_s *x, uint32_t slot) {
+    for (uint32_t i = 0; i < x->n; i++)
+        if (x->s[i] == slot) return 1;
+    return 0;
+}
+
+static int act_slots_add(struct act_slots_s *x, uint32_t slot) {
+    if (act_slots_has(x, slot)) return ZBC_OK;
+    if (x->n == x->cap) {
+        uint32_t cap = x->cap ? 2 * x->cap : 8;
+        void *p = realloc(x->s, cap * sizeof(*x->s));
+        if (!p) return ZBC_ERR_SOLVE_FAIL;
+        x->s = p; x->cap = cap;
+    }
+    x->s[x->n++] = slot;
+    return ZBC_OK;
+}
 
 static void act_par_build(const zbc_image_t *img, const zbc_act *a, zbc_actrun_t *r);
 
@@ -633,7 +732,8 @@ static void actrun_release(zbc_actrun_t *r) {
             free(r->par[i].key); free(r->par[i].shared); free(r->par[i].fp);
         }
         free(r->par);
-        free(r->bobj); free(r->bval); free(r->cl); free(r);
+        free(r->bobj); free(r->bval); free(r->cl);
+        free(r->attr_held.s); free(r->attr_claimed.s); free(r);
     }
 }
 
@@ -679,6 +779,7 @@ static void act_reset_node(const zbc_image_t *img, const zbc_act *a, zbc_actrun_
 static void act_enter_node(const zbc_image_t *img, const zbc_act *a, zbc_actrun_t *r,
                            uint32_t node, uint32_t site) {
     act_reset_node(img, a, r, node);
+    if (node == 0) r->attr_held.n = r->attr_claimed.n = 0;
     r->started[node] = 1;
     r->site_of[node] = site;
     if (site != ACT_NONE) r->fired[site] = 1;
@@ -698,6 +799,16 @@ static void act_enter_scope(const zbc_image_t *img, const zbc_act *a, zbc_actrun
         if (act_nested(img, a, scope, c)) r->entered[c] = 0;
     r->entered[scope] = 1;
     r->entered_at[scope] = ++r->clock;
+    /* A committing scope (a branch chosen: select branch, if/else, match
+     * case, loop body) frees the attributes no claim has fixed (F8.6e). */
+    uint32_t k = zbc_act_scope(img, a, scope)->kind;
+    if (k >= ACT_KIND_SELECT_BRANCH && k <= ACT_KIND_LOOP_BODY) {
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < r->attr_held.n; i++)
+            if (act_slots_has(&r->attr_claimed, r->attr_held.s[i]))
+                r->attr_held.s[m++] = r->attr_held.s[i];
+        r->attr_held.n = m;
+    }
 }
 
 /* A node's first scope (pyvm's _Node.scope_base): SCOPE_ENTER's imm is
@@ -747,6 +858,7 @@ static int act_in_force(const zbc_image_t *img, const zbc_act *a, const zbc_actr
     if (!(a->flags & 1u))
         for (uint32_t k = 0; k < c->n_nodes; k++)
             if (ns[k] != cur && !r->committed[ns[k]]) return 0;   /* no lookahead */
+    if (c->kind == 4) return 0;   /* INFER: this engine runs no inferred node (M9a3; M14) */
     if (c->kind == 0 || c->kind == 3) return act_node_live(img, a, r, c->owner);
     if (c->kind == 1) return act_scope_live(img, a, r, c->scope);
     const zbc_actsite *st = zbc_act_site(img, a, c->site);
@@ -998,9 +1110,26 @@ static int act_loop_counter(const interp_locals_t *L, const zbc_actvar *v,
 /* pyvm Activation._pin for what zbc_image_check lets through: 1 and *out
  * if `v` is pinned in the solve of `node`, 0 if free. `probe`: a
  * footprint probe's solve, where a loop index is free. */
+/* An exported action's argument for field `slot` of the run's root object
+ * (zbc_host_t pin_slot/pin_val), as pyvm VM.arg_bounds. */
+static int entry_pin(const interp_locals_t *L, uint32_t slot, uint64_t *out) {
+    const zbc_host_t *h = L->host;
+    for (uint32_t i = 0; h && i < h->n_pins; i++) {
+        if (h->pin_slot[i] == slot) {
+            *out = (uint64_t)h->pin_val[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int act_pin(const interp_locals_t *L, const zbc_actvar *v, uint32_t node,
                    int probe, uint64_t *out) {
     const zbc_actrun_t *r = L->ar;
+    /* The root node's fields an exported action's caller passed (F2.3b). */
+    if (v->node == 0 && (v->flags & 2u) && v->busy_pool == ACT_NONE
+            && entry_pin(L, v->slot, out))
+        return 1;
     if (v->busy_pool != ACT_NONE) {
         /* The instances a claim may not take; in other nodes' solves, what
          * a footprint keeps from it if it is not solved yet, else free. */
@@ -1022,6 +1151,13 @@ static int act_pin(const interp_locals_t *L, const zbc_actvar *v, uint32_t node,
             return 1;
         }
         if (!r->committed[v->node]) return 0;
+    }
+    if (v->flags & 16u) {
+        /* A resource attribute: held from the last solve that chose it,
+         * until a branch frees it; fixed once a claim takes it (F8.6e). */
+        if (!act_slots_has(&r->attr_held, v->slot)) return 0;
+        *out = v->slot < L->obj->n ? L->obj->slots[v->slot] : 0;
+        return 1;
     }
     if (v->comp_read != ACT_NONE) {
         *out = (L->img->cobj && v->comp_read < L->img->comp->n_slots)
@@ -1236,6 +1372,20 @@ out:
 /* pyvm Activation._attempt (write, with the constraints in force `en`):
  * solve cone `ci` with the pins; on success write the node's values and
  * make the solution the cone's witness. Returns ZBC_SOLVER_*. */
+/* pyvm Activation._keep_attrs: write and hold the values a solve of cone
+ * `ci` chose for its resource attributes no value holds yet (F8.6e). */
+static int act_keep_attrs(interp_locals_t *L, uint32_t ci, const uint64_t *vals) {
+    const zbc_actcone *cone = zbc_act_cone(L->img, L->act, ci);
+    for (uint32_t i = 0; i < cone->n_vars; i++) {
+        const zbc_actvar *v = zbc_act_var(L->img, cone->var0 + i);
+        if (!(v->flags & 16u) || act_slots_has(&L->ar->attr_held, v->slot)) continue;
+        if (v->slot >= L->obj->n) return ZBC_ERR_OOB_FIELD;
+        L->obj->slots[v->slot] = vals[i];
+        if (act_slots_add(&L->ar->attr_held, v->slot) != ZBC_OK) return ZBC_ERR_SOLVE_FAIL;
+    }
+    return ZBC_OK;
+}
+
 static int act_attempt(interp_locals_t *L, uint32_t ci, const uint8_t *en,
                        const uint32_t *pin_var, const int64_t *pin_val, uint32_t npin,
                        uint64_t seed, int64_t *vals, const void **adds) {
@@ -1264,6 +1414,7 @@ static int act_attempt(interp_locals_t *L, uint32_t ci, const uint8_t *en,
     for (uint32_t k = 0; k < cone->n_nodes; k++) r->wit_taken[ns[k]] = 0;
     r->wit_taken[node] = 1;
     r->wit_valid[ci] = 1;
+    if (act_keep_attrs(L, ci, (const uint64_t *)vals) != ZBC_OK) return ZBC_SOLVER_FAIL;
     return ZBC_SOLVER_OK;
 }
 
@@ -1403,6 +1554,17 @@ static int act_claim(interp_locals_t *L, uint32_t node, uint32_t comp) {
         h->pid = pid; h->node = node; h->site = r->by_site[node];
         h->iid = (uint32_t)L->obj->slots[c->iid_slot];
         h->lock = c->lock != 0; h->at = r->clock; h->held = 1;
+        /* The instance's attributes, as this claim's solve chose them, are
+         * fixed from now on (F8.6e). */
+        for (uint32_t ci = 0; ci < L->act->n_cones; ci++) {
+            const zbc_actcone *cn = zbc_act_cone(img, L->act, ci);
+            for (uint32_t i = 0; i < cn->n_vars; i++) {
+                const zbc_actvar *v = zbc_act_var(img, cn->var0 + i);
+                if ((v->flags & 16u) && v->pick == pid && (v->flags >> 16) == h->iid
+                        && act_slots_add(&r->attr_claimed, v->slot) != ZBC_OK)
+                    return ZBC_ERR_SOLVE_FAIL;
+            }
+        }
     }
     return ZBC_OK;
 }
@@ -1423,6 +1585,111 @@ static void act_release(zbc_actrun_t *r, uint32_t node) {
         if (r->cl[j].at < h->at) r->cl[j].at = h->at;
         r->cl[k] = r->cl[--r->n_cl];
     }
+}
+
+static void note_cone_unsat(interp_locals_t *L, uint32_t ci, const uint8_t *en, uint32_t nc,
+                            const uint32_t *pin_var, const int64_t *pin_val, uint32_t npin);
+
+/* `solve` (F3.10b) of node L->node in cone `ci`, as pyvm Activation.explain
+ * has it, less `dropped`: C has no constraint source, so it adds `act`,
+ * `cone`, `enabled` (constraints in force) and `witness` (the cone's values,
+ * when it has softs) for the host to find the dropped softs from (pssc
+ * native.explain_solves). `softs` counts the constraints in force written
+ * `soft ...`. */
+static void ev_solve(interp_locals_t *L, uint32_t ci, const uint8_t *en, uint64_t seed) {
+    const zbc_image_t *img = L->img;
+    const zbc_act *a = L->act;
+    zbc_actrun_t *r = L->ar;
+    zbc_ev_sink_t *s = L->host->events;
+    const zbc_actcone *cone = zbc_act_cone(img, a, ci);
+    const zbc_actnode *n = zbc_act_node(img, a, L->node);
+    uint32_t nv = cone->n_vars, nc = cone->n_cons, ne = 0, nsoft = 0, nval = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        if (!en[i]) continue;
+        ne++;
+        const char *t = zbc_image_act_str(img, zbc_act_con(img, cone->con0 + i)->text);
+        if (t && !strncmp(t, "soft ", 5)) nsoft++;
+    }
+    for (uint32_t i = 0; i < nv; i++) {
+        const zbc_actvar *v = zbc_act_var(img, cone->var0 + i);
+        if (v->node == L->node && (v->flags & 2u)) nval++;
+    }
+    int wit = nsoft && r->wit_valid[ci];
+    const char *path = zbc_image_act_str(img, n->path);
+    const char *type = zbc_image_act_str(img, n->type);
+    zbc_ev_begin(s, "solve", L->ev_id, img->code[L->coro->code_start + L->pc].src_ref);
+    zbc_ev_map(s, 9u + (uint32_t)wit);
+    zbc_ev_key(s, "site");
+    if (path && *path) zbc_ev_str(s, path, strlen(path));
+    else zbc_ev_str(s, "<root>", 6);
+    zbc_ev_key(s, "node"); zbc_ev_uint(s, L->node);
+    zbc_ev_key(s, "type");
+    zbc_ev_str(s, type ? type : "", type ? strlen(type) : 0);
+    zbc_ev_key(s, "seed"); zbc_ev_uint(s, seed);
+    zbc_ev_key(s, "values");
+    zbc_ev_map(s, nval);
+    for (uint32_t i = 0; i < nv; i++) {
+        const zbc_actvar *v = zbc_act_var(img, cone->var0 + i);
+        if (v->node != L->node || !(v->flags & 2u)) continue;
+        zbc_ev_key(s, zbc_image_act_str(img, v->name));
+        zbc_ev_int(s, act_domain_value(L->obj->slots[v->slot], v));
+    }
+    zbc_ev_key(s, "softs"); zbc_ev_uint(s, nsoft);
+    zbc_ev_key(s, "act"); zbc_ev_uint(s, a->coro);
+    zbc_ev_key(s, "cone"); zbc_ev_uint(s, ci);
+    zbc_ev_key(s, "enabled");
+    zbc_ev_list(s, ne);
+    for (uint32_t i = 0; i < nc; i++)
+        if (en[i]) zbc_ev_uint(s, i);
+    if (wit) {
+        zbc_ev_key(s, "witness");
+        zbc_ev_list(s, nv);
+        for (uint32_t i = 0; i < nv; i++)
+            zbc_ev_int(s, act_domain_value(r->wit_val[cone->var0 + i - r->var_lo],
+                                           zbc_act_var(img, cone->var0 + i)));
+    }
+    zbc_ev_end(s);
+}
+
+/* `solve` (F3.10b) of SOLVE problem `pid` (pyvm ops_orch _solve_event),
+ * less what needs the problem's names and source: `solve` (pid) and
+ * `solved` ([var_id, value] per written-back variable) let the host fill
+ * `values`, `softs` and `dropped` (pssc native.explain_solve). */
+static void ev_solve_op(interp_locals_t *L, uint32_t pid, uint64_t seed,
+                        const uint32_t *pairs, uint32_t nwb, int procedural) {
+    zbc_ev_sink_t *s = L->host->events;
+    const char *nm = zbc_image_str(L->img, L->coro->name);
+    size_t nl = nm ? strlen(nm) : 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < nwb; i++)
+        if (procedural ? pairs[2 * i] < L->n_solved
+                       : L->obj && (uint64_t)L->base + pairs[2 * i] < L->obj->n) n++;
+    zbc_ev_begin(s, "solve", L->ev_id, L->img->code[L->coro->code_start + L->pc].src_ref);
+    zbc_ev_map(s, 9);
+    zbc_ev_key(s, "site"); zbc_ev_str(s, nm ? nm : "", nl);
+    zbc_ev_key(s, "node"); zbc_ev_uint(s, L->node);
+    zbc_ev_key(s, "type"); zbc_ev_str(s, nm ? nm : "", nl);
+    zbc_ev_key(s, "seed"); zbc_ev_uint(s, seed);
+    zbc_ev_key(s, "values"); zbc_ev_map(s, 0);
+    zbc_ev_key(s, "softs"); zbc_ev_uint(s, 0);
+    zbc_ev_key(s, "dropped"); zbc_ev_list(s, 0);
+    zbc_ev_key(s, "solve"); zbc_ev_uint(s, pid);
+    zbc_ev_key(s, "solved");
+    zbc_ev_list(s, n);
+    for (uint32_t i = 0; i < nwb; i++) {
+        uint64_t v;
+        if (procedural) {
+            if (pairs[2 * i] >= L->n_solved) continue;
+            v = (uint64_t)L->solved[pairs[2 * i]];
+        } else {
+            if (!L->obj || (uint64_t)L->base + pairs[2 * i] >= L->obj->n) continue;
+            v = L->obj->slots[L->base + pairs[2 * i]];
+        }
+        zbc_ev_list(s, 2);
+        zbc_ev_uint(s, pairs[2 * i + 1]);
+        zbc_ev_uint(s, v);
+    }
+    zbc_ev_end(s);
 }
 
 /* pyvm Activation.solve for a node of cone `ci` with no picks, pools or
@@ -1479,10 +1746,13 @@ static int act_solve(interp_locals_t *L, uint32_t ci, uint64_t seed) {
                 L->obj->slots[v->slot] = r->wit_val[cone->var0 + i - r->var_lo];
         }
         r->wit_taken[node] = 1;
+        rc = act_keep_attrs(L, ci, r->wit_val + (cone->var0 - r->var_lo));
+        if (rc != ZBC_OK) goto out;
     } else {
         int sr = act_attempt(L, ci, en, pin_var, pin_val, npin, seed, vals, adds);
         if (sr != ZBC_SOLVER_OK) {
             rc = sr == ZBC_SOLVER_UNSAT ? ZBC_ERR_SOLVE_UNSAT : ZBC_ERR_SOLVE_FAIL;
+            if (sr == ZBC_SOLVER_UNSAT) note_cone_unsat(L, ci, en, nc, pin_var, pin_val, npin);
             goto out;
         }
     }
@@ -1505,6 +1775,7 @@ committed:
         rc = act_claim(L, node, comp);
         if (rc != ZBC_OK) goto out;
     }
+    if (ev_mask(L) & ZBC_EV_SOLVE) ev_solve(L, ci, en, seed);
     rc = ZBC_OK;
 out:
     free(en); free(pv); free(vals); free(pin_var); free(pin_val); free(adds);
@@ -1571,6 +1842,61 @@ static int act_exit_node(interp_locals_t *L) {
         }
     }
     return ZBC_OK;
+}
+
+/* F3.8c: the run's first error is about to be the unsat SOLVE `pid`: keep it
+ * and its pins on the yield for the host's error. */
+static void note_unsat(interp_locals_t *L, uint32_t pid, const uint32_t *pin_var,
+                       const int64_t *pin_val, uint32_t npin) {
+    if (!L->run || L->run->status != ZBC_OK || !L->host || !L->host->yield) return;
+    zbc_yield_t *y = L->host->yield;
+    uint32_t max = (uint32_t)(sizeof(y->err_pin_var) / sizeof(y->err_pin_var[0]));
+    y->err_solve = pid;
+    y->err_npin = npin < max ? npin : max;
+    for (uint32_t i = 0; i < y->err_npin; i++) {
+        y->err_pin_var[i] = pin_var[i];
+        y->err_pin_val[i] = pin_val[i];
+    }
+}
+
+/* F3.8c: ... or the unsat cone `ci` of the run's activation, with its
+ * constraints in force `en` (nc flags) and pins; skipped when they do not fit. */
+static void note_cone_unsat(interp_locals_t *L, uint32_t ci, const uint8_t *en, uint32_t nc,
+                            const uint32_t *pin_var, const int64_t *pin_val, uint32_t npin) {
+    if (!L->run || L->run->status != ZBC_OK || !L->host || !L->host->yield || !L->act) return;
+    zbc_yield_t *y = L->host->yield;
+    uint32_t max = (uint32_t)(sizeof(y->err_en) / sizeof(y->err_en[0])), ne = 0;
+    for (uint32_t i = 0; i < nc; i++) ne += en[i] != 0;
+    if (ne > max || npin > max) return;
+    y->err_act = L->act->coro;
+    y->err_cone = ci;
+    y->err_nen = 0;
+    for (uint32_t i = 0; i < nc; i++)
+        if (en[i]) y->err_en[y->err_nen++] = i;
+    y->err_npin = npin;
+    for (uint32_t i = 0; i < npin; i++) {
+        y->err_pin_var[i] = pin_var[i];
+        y->err_pin_val[i] = pin_val[i];
+    }
+}
+
+/* Floats (F6.6): a register's 64 bits as a binary64, and back. */
+static double f_of(uint64_t b) { double d; memcpy(&d, &b, sizeof d); return d; }
+static uint64_t bits_of(double d) { uint64_t b; memcpy(&b, &d, sizeof b); return b; }
+
+/* Division by zero as the Python VM does it (ops_proc._fdiv): 0/0 and NaN/0
+ * give a positive quiet NaN, not the x86 default NaN, so the bits match. */
+static double f_div(double a, double b) {
+    if (b != 0.0) return a / b;
+    if (a != a || a == 0.0) return f_of(0x7FF8000000000000ull);
+    return ((a < 0) != (signbit(b) != 0)) ? -HUGE_VAL : HUGE_VAL;
+}
+
+/* binary64 to int64, truncated; NaN or out of range gives INT64_MIN's bits. */
+static uint64_t f2s(double x) {
+    if (x != x || !(x >= -9223372036854775808.0 && x < 9223372036854775808.0))
+        return 0x8000000000000000ull;
+    return (uint64_t)(int64_t)x;
 }
 
 static zsp_frame_t *halt(zsp_thread_t *thread, interp_locals_t *L,
@@ -1645,6 +1971,8 @@ static zsp_frame_t *halt(zsp_thread_t *thread, interp_locals_t *L,
                         interp_locals_t *cl = zsp_frame_locals(f, interp_locals_t);
                         if (cl->is_node && cl->ar && cl->act && cl->node < cl->act->n_nodes)
                             act_release(cl->ar, cl->node);
+                        free(cl->key_cnt);
+                        cl->key_cnt = NULL;
                     }
                     zsp_timebase_cancel(thread->timebase, sib->self_thread);
                 }
@@ -1656,6 +1984,9 @@ static zsp_frame_t *halt(zsp_thread_t *thread, interp_locals_t *L,
     if (L->host && L->host->dbg) dbg_unlink(L->host->dbg, L);
     actrun_release(L->ar);
     L->ar = NULL;
+    free(L->key_cnt);
+    L->key_cnt = NULL;
+    L->key_n = L->key_cap = 0;
     /* A callee that completes inside its caller's CALL (sync_call) pops its
      * frame and returns to that CALL, which resumes the caller in its own
      * loop. Letting zsp_timebase_return re-enter the caller instead nests
@@ -1687,8 +2018,8 @@ static void frame_cbase(interp_locals_t *L) {
 
 /* A frame's activation context (P4.10c4). A root (ZBC_FRAME_ROOT) runs node
  * 0 of the activation rooted at its coroutine, if any, in the host's
- * instance; as pyvm's VM.root_frame, which runs it in instance 0 + the root
- * node's comp_rel (0). cbase follows comp. */
+ * instance + the root node's one candidate; as pyvm's VM.root_frame, which
+ * runs it in instance 0 + the root node's comp_rel. cbase follows comp. */
 static void frame_comp(interp_locals_t *L, int coro_index) {
     uint32_t hbase = L->host ? L->host->cbase : 0;
     if (L->node == 0xFFFFFFFEu) {
@@ -1698,6 +2029,10 @@ static void frame_comp(interp_locals_t *L, int coro_index) {
         if (L->act && L->img->comp_bases) {
             for (uint32_t i = 0; i < L->img->comp->n_inst; i++)
                 if (L->img->comp_bases[i] == hbase) { L->comp = i; break; }
+            /* + node 0's one candidate: an action of a sub-component (comp_rel) */
+            const zbc_actnode *n0 = zbc_act_node(L->img, L->act, 0);
+            if (L->comp != 0xFFFFFFFFu && n0->n_comp == 1)
+                L->comp += zbc_act_list(L->img, n0->comp0)[0];
         }
     }
     frame_cbase(L);
@@ -1722,6 +2057,42 @@ static void child_node(const interp_locals_t *L, uint32_t local,
             : L->comp + zbc_act_list(L->img, n->comp0)[0];
         return;
     }
+}
+
+
+/* PSS files (file_open, F6.11c): handle h is f_files[h - 1]; 0 is
+ * nullfilehandle. Process-wide, as the Python VM's per-VM `files`. */
+#define ZBC_MAX_FILES 64
+static FILE *f_files[ZBC_MAX_FILES];
+static uint8_t f_modes[ZBC_MAX_FILES];
+static uint32_t f_n;
+
+static uint64_t file_open(const char *name, uint64_t mode) {
+    static const char *const modes[] = { "w", "a", "r" };   /* file_option_e */
+    if (mode > 2 || f_n >= ZBC_MAX_FILES) return 0;
+    FILE *f = fopen(name, modes[mode]);
+    if (f == NULL) return 0;
+    f_files[f_n] = f;
+    f_modes[f_n] = (uint8_t)mode;
+    return ++f_n;
+}
+
+static FILE *file_get(uint64_t h) {
+    return (h > 0 && h <= f_n) ? f_files[h - 1] : NULL;
+}
+
+static int file_close(uint64_t h) {
+    FILE *f = file_get(h);
+    if (f == NULL) return 0;
+    fclose(f);
+    f_files[h - 1] = NULL;
+    return 1;
+}
+
+void zbc_files_close_all(void) {
+    for (uint32_t i = 0; i < f_n; i++)
+        if (f_files[i]) fclose(f_files[i]);
+    f_n = 0;
 }
 
 zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
@@ -1770,7 +2141,14 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
         }
         L->comp = va_arg(*args, uint32_t);
         L->ar = va_arg(*args, zbc_actrun_t *);
+        /* A called frame inherits its caller's executor; a spawned thread's
+         * spawner sets it after the create. */
+        L->executor = ret->prev && ret->prev->func == &zbc_interp_task
+            ? zsp_frame_locals(ret->prev, interp_locals_t)->executor : 0xFFFFFFFFu;
+        L->called = ret->prev && ret->prev->func == &zbc_interp_task
+            && zsp_frame_locals(ret->prev, interp_locals_t)->sync_call;
         int is_root = L->node == 0xFFFFFFFEu;
+        L->is_entry = is_root;
         frame_comp(L, coro_index);
         if (is_root && L->act) {
             L->ar = actrun_new(L->img, L->act);
@@ -1784,7 +2162,11 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
             memset(L->call_args, 0, sizeof(L->call_args));
         }
         memset(L->staged, 0, sizeof(L->staged));
+        memset(L->results, 0, sizeof(L->results));
         L->child_index = 0;
+        L->origin = L->seed_state;
+        L->key_cnt = NULL;
+        L->key_n = L->key_cap = 0;
         L->pc = start_pc;
         L->steps = (L->host && L->host->step_limit) ? L->host->step_limit
                                                    : ZBC_STEP_LIMIT;
@@ -1799,6 +2181,8 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
         L->n_children = 0;
         L->join_pending = 0;
         L->n_staged = 0;
+        L->n_pins = 0;
+        L->n_solved = 0;
         L->ev_id = (L->host && L->host->events) ? L->host->events->next_id++ : 0;
         L->ev_skip_pc = 0xFFFFFFFFu;
         L->dbg_id = (L->host && L->host->dbg) ? ++L->host->dbg->next_id : 0;
@@ -1988,15 +2372,16 @@ resume:
         case ZBC_OP_LD_COMP:
             if (!L->img->cobj) return halt(thread, L, ZBC_ERR_NO_OBJ, in->op, 0);
             if (L->comp == COMP_UNCHOSEN) return halt(thread, L, ZBC_ERR_COMP_UNCHOSEN, in->op, 0);
-            if ((uint64_t)L->cbase + a1 >= L->img->comp->n_slots)
+            /* the slot wraps at 2^32: a reference reaches before the frame */
+            if ((uint32_t)(L->cbase + a1) >= L->img->comp->n_slots)
                 return halt(thread, L, ZBC_ERR_OOB_COMP, in->op, 0);
-            L->regs[a0] = L->img->cobj[L->cbase + a1]; L->pc++; break;
+            L->regs[a0] = L->img->cobj[(uint32_t)(L->cbase + a1)]; L->pc++; break;
         case ZBC_OP_ST_COMP:
             if (!L->img->cobj) return halt(thread, L, ZBC_ERR_NO_OBJ, in->op, 0);
             if (L->comp == COMP_UNCHOSEN) return halt(thread, L, ZBC_ERR_COMP_UNCHOSEN, in->op, 0);
-            if ((uint64_t)L->cbase + a1 >= L->img->comp->n_slots)
+            if ((uint32_t)(L->cbase + a1) >= L->img->comp->n_slots)
                 return halt(thread, L, ZBC_ERR_OOB_COMP, in->op, 0);
-            L->img->cobj[L->cbase + a1] = L->regs[a0]; L->pc++; break;
+            L->img->cobj[(uint32_t)(L->cbase + a1)] = L->regs[a0]; L->pc++; break;
 
         case ZBC_OP_ADD: L->regs[a0] = L->regs[a1] + L->regs[a2]; L->pc++; break;
         case ZBC_OP_SUB: L->regs[a0] = L->regs[a1] - L->regs[a2]; L->pc++; break;
@@ -2021,6 +2406,78 @@ resume:
         case ZBC_OP_CMP_LE: L->regs[a0] = (L->regs[a1] <= L->regs[a2]); L->pc++; break;
         case ZBC_OP_CMP_GT: L->regs[a0] = (L->regs[a1] >  L->regs[a2]); L->pc++; break;
         case ZBC_OP_CMP_GE: L->regs[a0] = (L->regs[a1] >= L->regs[a2]); L->pc++; break;
+
+        /* Floats (F6.6): registers hold binary64 bit patterns
+         * (be-bc value-abi.md 1.1). */
+        case ZBC_OP_FARITH: {
+            double fa = f_of(L->regs[a1]), fr;
+            double fb = (in->imm != ZBC_FARITH_NEG) ? f_of(L->regs[a2]) : 0.0;
+            switch (in->imm) {
+            case ZBC_FARITH_ADD: fr = fa + fb; break;
+            case ZBC_FARITH_SUB: fr = fa - fb; break;
+            case ZBC_FARITH_MUL: fr = fa * fb; break;
+            case ZBC_FARITH_DIV: fr = f_div(fa, fb); break;
+            case ZBC_FARITH_NEG: fr = -fa; break;
+            default: return halt(thread, L, ZBC_ERR_UNSUPPORTED_OP, in->op, 0);
+            }
+            L->regs[a0] = bits_of(fr); L->pc++; break;
+        }
+        case ZBC_OP_FCMP: {
+            double fa = f_of(L->regs[a1]), fb = f_of(L->regs[a2]);
+            int r;
+            switch (in->imm) {
+            case ZBC_FCMP_EQ: r = fa == fb; break;
+            case ZBC_FCMP_NE: r = fa != fb; break;
+            case ZBC_FCMP_LT: r = fa <  fb; break;
+            case ZBC_FCMP_LE: r = fa <= fb; break;
+            case ZBC_FCMP_GT: r = fa >  fb; break;
+            case ZBC_FCMP_GE: r = fa >= fb; break;
+            default: return halt(thread, L, ZBC_ERR_UNSUPPORTED_OP, in->op, 0);
+            }
+            L->regs[a0] = (uint64_t)r; L->pc++; break;
+        }
+        case ZBC_OP_FMATH: {
+            /* The PSS float library (LRM 24.5.2, Table 28), in be-bc model.py
+             * FMATH_FNS order; a 1-argument function ignores a2. */
+            double fa = f_of(L->regs[a1]), fb = f_of(L->regs[a2]), fr;
+            switch (in->imm) {
+            case 0:  fr = log(fa); break;
+            case 1:  fr = log10(fa); break;
+            case 2:  fr = exp(fa); break;
+            case 3:  fr = sqrt(fa); break;
+            case 4:  fr = pow(fa, fb); break;
+            case 5:  fr = round(fa); break;
+            case 6:  fr = floor(fa); break;
+            case 7:  fr = ceil(fa); break;
+            case 8:  fr = sin(fa); break;
+            case 9:  fr = cos(fa); break;
+            case 10: fr = tan(fa); break;
+            case 11: fr = asin(fa); break;
+            case 12: fr = acos(fa); break;
+            case 13: fr = atan(fa); break;
+            case 14: fr = atan2(fa, fb); break;
+            case 15: fr = hypot(fa, fb); break;
+            case 16: fr = sinh(fa); break;
+            case 17: fr = cosh(fa); break;
+            case 18: fr = tanh(fa); break;
+            case 19: fr = asinh(fa); break;
+            case 20: fr = acosh(fa); break;
+            case 21: fr = atanh(fa); break;
+            default: return halt(thread, L, ZBC_ERR_UNSUPPORTED_OP, in->op, 0);
+            }
+            L->regs[a0] = bits_of(fr); L->pc++; break;
+        }
+        case ZBC_OP_FCVT: {
+            uint64_t v = L->regs[a1], r;
+            switch (in->imm) {
+            case ZBC_FCVT_S2F: r = bits_of((double)(int64_t)v); break;
+            case ZBC_FCVT_U2F: r = bits_of((double)v); break;
+            case ZBC_FCVT_F2S: r = f2s(f_of(v)); break;
+            case ZBC_FCVT_F32: r = bits_of((double)(float)f_of(v)); break;
+            default: return halt(thread, L, ZBC_ERR_UNSUPPORTED_OP, in->op, 0);
+            }
+            L->regs[a0] = r; L->pc++; break;
+        }
 
         case ZBC_OP_BR:  L->pc = a0; break;
         case ZBC_OP_BRZ: L->pc = (L->regs[a0] == 0) ? a1 : L->pc + 1; break;
@@ -2062,13 +2519,14 @@ resume:
                     return halt(thread, L, ZBC_ERR_SPAWN_LIMIT, in->op, 0);
                 }
                 if (L->spawn_budget) (*L->spawn_budget)--;
-                zsp_timebase_thread_create(
+                zsp_thread_t *nb = zsp_timebase_thread_create(
                     thread->timebase, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
                     L->img, (int)target, (zbc_result_t *)0, L->obj, obase,
                     L->spawn_budget, L->host,
-                    fork_seed(L->seed_state, L->child_index++),
+                    child_seed(L, target),
                     (const uint64_t *)0, (uint32_t)0, L->run, start,
                     L->act, cnode_arg, ccomp, L->ar);
+                zsp_frame_locals(nb->leaf, interp_locals_t)->executor = L->executor;
                 L->pc++;
                 break;
             }
@@ -2081,7 +2539,7 @@ resume:
             return zsp_timebase_call(thread, &zbc_interp_task,
                                      L->img, (int)target, (zbc_result_t *)0,
                                      L->obj, obase, L->spawn_budget, L->host,
-                                     fork_seed(L->seed_state, L->child_index++),
+                                     child_seed(L, target),
                                      (const uint64_t *)0, (uint32_t)0, L->run, start,
                                      L->act, cnode_arg, ccomp, L->ar);
         }
@@ -2105,12 +2563,13 @@ resume:
                 thread->timebase, &zbc_interp_task, ZSP_THREAD_FLAGS_NONE,
                 L->img, (int)target, (zbc_result_t *)0, L->obj, L->base,
                 L->spawn_budget, L->host,
-                fork_seed(L->seed_state, L->child_index++),
+                child_seed(L, target),
                 (const uint64_t *)0, (uint32_t)0, L->run, (uint32_t)0,
                 L->act, L->node, L->comp, L->ar);
             interp_locals_t *cl = zsp_frame_locals(child->leaf, interp_locals_t);
             cl->parent_locals = L;
             cl->parent_thread = thread;
+            cl->executor = L->executor;
             cl->counted = 0;                    /* JOIN decides joinability */
             L->children[L->n_children++] = cl;
             L->pc++;
@@ -2160,7 +2619,7 @@ resume:
 
         case ZBC_OP_SCOPE_ENTER: {
             /* Entry to an activity block (pyvm _op_scope_enter): reset what
-             * it traverses. zbc_image_check refuses it until P4.10d1b. */
+             * it traverses. */
             if (L->ar) {
                 uint32_t sb = act_scope_base(L->img, L->act, L->node);
                 uint32_t sc = sb + (uint32_t)in->imm;
@@ -2224,8 +2683,13 @@ resume:
                 return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
             }
             const zbc_solve *p = &L->img->solves[pid];
+            if (p->flags & ZBC_SOLVE_ARRAYS) {
+                /* A problem reading lists: no heap here yet (M14). */
+                return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
+            }
             uint32_t nwb = p->n_writeback;
-            uint64_t need = (uint64_t)p->oplist_off + 2ull * nwb;
+            uint32_t nin = p->n_input;
+            uint64_t need = (uint64_t)p->oplist_off + 2ull * ((uint64_t)nwb + nin);
             if (need > L->img->oplist_count) {
                 return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
             }
@@ -2237,6 +2701,38 @@ resume:
                 seed = L->seed_state;
             }
             const uint32_t *pairs = L->img->oplist + p->oplist_off;
+            if (p->flags & ZBC_SOLVE_PROCEDURAL) {
+                /* `randomize x with {...}` (F3.7c): solve with the staged
+                 * pins, keep each pair's var in solved[k] for SOLVE_GET; the
+                 * statement's own stores move the values. No commit. */
+                uint32_t np = L->n_pins;
+                L->n_pins = 0;
+                if (!p->prob_len || !L->img->sprob ||
+                    (uint64_t)p->prob_off + p->prob_len > L->img->sprob_count) {
+                    return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
+                }
+                uint32_t nk = 0;
+                for (uint32_t i = 0; i < nwb; i++) {
+                    if (pairs[2 * i] >= ZBC_SOLVE_MAX_VARS) {
+                        return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
+                    }
+                    if (pairs[2 * i] + 1 > nk) nk = pairs[2 * i] + 1;
+                }
+                int sr = zbc_solver_run_pinned(L->img->sprob + p->prob_off, seed,
+                                               pairs, nwb, L->solved,
+                                               L->pin_var, L->pin_val, np);
+                if (sr == ZBC_SOLVER_UNSAT) {
+                    note_unsat(L, pid, L->pin_var, L->pin_val, np);
+                    return halt(thread, L, ZBC_ERR_SOLVE_UNSAT, in->op, 0);
+                }
+                if (sr != ZBC_SOLVER_OK) {
+                    return halt(thread, L, ZBC_ERR_SOLVE_FAIL, in->op, 0);
+                }
+                L->n_solved = nk;
+                if (ev_mask(L) & ZBC_EV_SOLVE) ev_solve_op(L, pid, seed, pairs, nwb, 1);
+                L->pc++;
+                break;
+            }
             if (p->prob_len) {
                 /* Real solve: bound the blob, validate slots, then drive dv-solve. */
                 if (!L->img->sprob ||
@@ -2249,10 +2745,36 @@ resume:
                             return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
                         }
                     }
+                    /* The entry frame keeps to its caller's arguments (F2.3b). */
+                    uint32_t pin_var[ZBC_CALL_MAX_ARGS + ZBC_SOLVE_MAX_INPUTS];
+                    int64_t pin_val[ZBC_CALL_MAX_ARGS + ZBC_SOLVE_MAX_INPUTS];
+                    uint32_t npin = 0;
+                    if (nin > ZBC_SOLVE_MAX_INPUTS) {
+                        return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
+                    }
+                    for (uint32_t i = 0; L->is_entry && L->host && i < nwb
+                            && npin < L->host->n_pins && npin < ZBC_CALL_MAX_ARGS; i++) {
+                        uint64_t v;
+                        if (entry_pin(L, L->base + pairs[2 * i], &v)) {
+                            pin_var[npin] = pairs[2 * i + 1];
+                            pin_val[npin++] = (int64_t)v;
+                        }
+                    }
+                    /* Non-rand fields a constraint reads hold their values (F3.7b2). */
+                    for (uint32_t i = nwb; i < nwb + nin; i++) {
+                        uint64_t slot = (uint64_t)L->base + pairs[2 * i];
+                        if (slot >= L->obj->n) {
+                            return halt(thread, L, ZBC_ERR_OOB_FIELD, in->op, 0);
+                        }
+                        pin_var[npin] = pairs[2 * i + 1];
+                        pin_val[npin++] = (int64_t)L->obj->slots[slot];
+                    }
                     /* Writeback slots are relative to the frame's base. */
-                    int sr = zbc_solver_run(L->img->sprob + p->prob_off, seed,
-                                            pairs, nwb, L->obj->slots + L->base);
+                    int sr = zbc_solver_run_pinned(L->img->sprob + p->prob_off, seed,
+                                                   pairs, nwb, L->obj->slots + L->base,
+                                                   pin_var, pin_val, npin);
                     if (sr == ZBC_SOLVER_UNSAT) {
+                        note_unsat(L, pid, pin_var, pin_val, npin);
                         return halt(thread, L, ZBC_ERR_SOLVE_UNSAT, in->op, 0);
                     }
                     if (sr != ZBC_SOLVER_OK) {
@@ -2269,6 +2791,7 @@ resume:
                     L->obj->slots[slot] = seed + var_id;
                 }
             }
+            if (ev_mask(L) & ZBC_EV_SOLVE) ev_solve_op(L, pid, seed, pairs, nwb, 0);
             if (L->ar && L->node < L->act->n_nodes) {       /* act.commit */
                 L->ar->committed[L->node] = 1;
                 L->ar->by_site[L->node] = L->ar->site_of[L->node];
@@ -2277,19 +2800,52 @@ resume:
             break;
         }
 
+        case ZBC_OP_SOLVE_PIN: {
+            /* Stage input var a0 = reg a1 for the frame's next SOLVE (F3.7b);
+             * a later pin of the same var replaces it. */
+            uint32_t k = 0;
+            while (k < L->n_pins && L->pin_var[k] != a0) k++;
+            if (k == ZBC_SOLVE_MAX_INPUTS) {
+                return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
+            }
+            if (k == L->n_pins) L->n_pins++;
+            L->pin_var[k] = a0;
+            L->pin_val[k] = (int64_t)L->regs[a1];
+            L->pc++;
+            break;
+        }
+
+        case ZBC_OP_SOLVE_GET: {
+            if (a1 >= L->n_solved) {   /* no procedural SOLVE kept it */
+                return halt(thread, L, ZBC_ERR_BAD_SOLVE, in->op, 0);
+            }
+            L->regs[a0] = L->solved[a1];
+            L->pc++;
+            break;
+        }
+
         case ZBC_OP_IMPORT: {
             /* The interpreter's window to the outside world. The instruction fully
              * encodes the call (fn_id=arg0, ret reg=arg1 or 0xFFFFFFFF void, arg
-             * regs=arg2/arg3), so we just record it in the host log and read a
-             * per-fn_id return value. Synchronous in M1 (even a BLOCKING import
-             * completes inline), matching the oracle's _op_import -> CONTINUE. */
+             * regs=arg2/arg3, or imm = n > 0 arguments staged by ARG as for
+             * CALL, consumed once the call completes), so we just record it in
+             * the host log and read a per-fn_id return value. Synchronous in M1
+             * (even a BLOCKING import completes inline), matching the oracle's
+             * _op_import -> CONTINUE. */
             uint32_t fn_id = a0;
             uint32_t ret_slot = a1;
-            uint32_t nval = (in->nargs > 2) ? (in->nargs - 2) : 0;
-            if (nval > ZBC_IMPORT_MAX_ARGS) nval = ZBC_IMPORT_MAX_ARGS;
             uint64_t argv[ZBC_IMPORT_MAX_ARGS];
-            if (nval > 0) argv[0] = L->regs[a2];
-            if (nval > 1) argv[1] = L->regs[in->arg3];
+            uint32_t nval;
+            uint32_t n_res = (uint32_t)(in->imm >> 8) & 0xFFu;
+            if ((in->imm & 0xFF) > 0) {
+                nval = (uint32_t)in->imm & 0xFFu;
+                for (uint32_t i = 0; i < nval; i++)
+                    argv[i] = i < L->n_staged ? L->staged[i] : 0;
+            } else {
+                nval = (in->nargs > 2) ? (in->nargs - 2) : 0;
+                if (nval > 0) argv[0] = L->regs[a2];
+                if (nval > 1) argv[1] = L->regs[in->arg3];
+            }
 
             /* P4.3b: a pssvm call's host answers anything but the message
              * builtins out of the run. The first visit posts the request and
@@ -2299,11 +2855,14 @@ resume:
             uint64_t answer = 0;
             if (L->host && L->host->yield && fn_id != ZBC_BUILTIN_ERROR
                     && fn_id != ZBC_BUILTIN_MESSAGE && fn_id != ZBC_BUILTIN_ERROR_MSG
-                    && fn_id != ZBC_BUILTIN_FATAL_MSG) {
+                    && fn_id != ZBC_BUILTIN_FATAL_MSG && fn_id != ZBC_BUILTIN_PRINT
+                    && (fn_id < ZBC_BUILTIN_FILE_OPEN || fn_id > ZBC_BUILTIN_URANDOM_RANGE)) {
                 zbc_yield_t *y = L->host->yield;
                 if (y->state == ZBC_YIELD_DONE && y->frame == L) {
                     answer = y->value;
                     have_answer = 1;
+                    /* A struct result: its leaves, for LD_RES (F6.4b2). */
+                    for (uint32_t i = 0; i < n_res; i++) L->results[i] = y->values[i];
                     y->state = ZBC_YIELD_NONE;
                     y->frame = NULL;
                     y->thread = NULL;
@@ -2313,7 +2872,9 @@ resume:
                         y->n_args = nval;
                         for (uint32_t i = 0; i < nval; i++) y->args[i] = argv[i];
                         y->flags = in->flags & (ZBC_F_BLOCKING | ZBC_F_HAS_RET);
-                        if (ret_slot == 0xFFFFFFFFu) y->flags &= ~(uint32_t)ZBC_F_HAS_RET;
+                        if (ret_slot == 0xFFFFFFFFu && n_res == 0)
+                            y->flags &= ~(uint32_t)ZBC_F_HAS_RET;
+                        y->n_ret = n_res ? n_res : ((y->flags & ZBC_F_HAS_RET) ? 1u : 0u);
                         if (fn_id >= ZBC_BUILTIN_MEM_FIRST && fn_id <= ZBC_BUILTIN_MEM_LAST) {
                             uint32_t k = fn_id - ZBC_BUILTIN_MEM_FIRST;
                             uint32_t nb = 1u << (k & 3u);
@@ -2333,6 +2894,7 @@ resume:
                         y->value = 0;
                         y->thread = thread;
                         y->frame = L;
+                        y->executor = L->executor;
                         y->pc = L->coro->code_start + L->pc;
                         y->state = ZBC_YIELD_PENDING;
                     }
@@ -2367,8 +2929,78 @@ resume:
                 }
                 return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
             }
+            if (fn_id == ZBC_BUILTIN_URANDOM || fn_id == ZBC_BUILTIN_URANDOM_RANGE) {
+                /* urandom()/urandom_range() (24.4): this frame's seed stream,
+                 * one draw, as determinism.py urandom/urandom_range. */
+                L->seed_state = lcg_next(L->seed_state);
+                uint64_t urv;
+                if (fn_id == ZBC_BUILTIN_URANDOM) {
+                    urv = L->seed_state >> 32;
+                } else {
+                    uint64_t lo = (nval > 0 ? argv[0] : 0) & 0xFFFFFFFFu;
+                    uint64_t hi = (nval > 1 ? argv[1] : 0) & 0xFFFFFFFFu;
+                    if (lo > hi) { uint64_t t = lo; lo = hi; hi = t; }
+                    urv = lo + L->seed_state % (hi - lo + 1);
+                }
+                if ((in->flags & ZBC_F_HAS_RET) && ret_slot != 0xFFFFFFFFu)
+                    L->regs[ret_slot] = urv;
+                L->pc++;
+                break;
+            }
+            if (fn_id >= ZBC_BUILTIN_FILE_OPEN && fn_id <= ZBC_BUILTIN_FILE_EXISTS) {
+                /* file_open/close/exists (24.2); names are model strings. */
+                const zbc_msgtab *mt = L->img->msgtab;
+                const char *name = (fn_id != ZBC_BUILTIN_FILE_CLOSE && mt && nval > 0
+                                    && argv[0] < mt->n_model_strings)
+                    ? L->img->msgstrb + L->img->msgstr_off[argv[0]] : NULL;
+                uint64_t frv = 0;
+                if (fn_id == ZBC_BUILTIN_FILE_EXISTS) {
+                    FILE *f = name ? fopen(name, "r") : NULL;
+                    if (f) { fclose(f); frv = 1; }
+                } else if (fn_id == ZBC_BUILTIN_FILE_OPEN) {
+                    frv = name && nval > 1 ? file_open(name, argv[1]) : 0;
+                } else if (!file_close(nval > 0 ? argv[0] : 0)) {
+                    char txt[64];
+                    int n = snprintf(txt, sizeof(txt), "file handle %llu: not an open file",
+                                     (unsigned long long)(nval > 0 ? argv[0] : 0));
+                    if (L->host && L->host->message)
+                        L->host->message(L->host->msg_ctx, ZBC_MSG_SEV_RUNTIME, 0, txt, (uint32_t)n);
+                    return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
+                }
+                if ((in->flags & ZBC_F_HAS_RET) && ret_slot != 0xFFFFFFFFu)
+                    L->regs[ret_slot] = frv;
+                L->pc++;
+                break;
+            }
+            if (fn_id == ZBC_BUILTIN_FILE_WRITE) {
+                /* file_write(handle, fmt, ...): the text as formatted, no
+                 * newline (24.2); slot0 holds the handle. */
+                const zbc_msgtab *mt = L->img->msgtab;
+                uint32_t mi = mt && nval > 0 && argv[0] < mt->n_msgs ? (uint32_t)argv[0] : 0xFFFFFFFFu;
+                if (mi == 0xFFFFFFFFu) return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
+                char txt[ZBC_MSG_TEXT_MAX];
+                uint64_t h = 0;
+                int n = zbc_format_message(L->img, mi, L->locals, txt, sizeof(txt), &h);
+                if (n < 0) return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
+                FILE *f = file_get(h);
+                if (f == NULL || f_modes[h - 1] == 2) {
+                    char e[96];
+                    int en = snprintf(e, sizeof(e), f ? "file handle %llu: opened for reading, not writing"
+                                                      : "file handle %llu: not an open file",
+                                      (unsigned long long)h);
+                    if (L->host && L->host->message)
+                        L->host->message(L->host->msg_ctx, ZBC_MSG_SEV_RUNTIME, 0, e, (uint32_t)en);
+                    return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
+                }
+                fwrite(txt, 1, (size_t)n, f);
+                fflush(f);
+                L->pc++;
+                break;
+            }
             if (fn_id == ZBC_BUILTIN_MESSAGE || fn_id == ZBC_BUILTIN_ERROR_MSG
-                    || fn_id == ZBC_BUILTIN_FATAL_MSG) {
+                    || fn_id == ZBC_BUILTIN_FATAL_MSG || fn_id == ZBC_BUILTIN_PRINT) {
+                /* print() is a message() at any verbosity, level 0. */
+                int info = fn_id == ZBC_BUILTIN_MESSAGE || fn_id == ZBC_BUILTIN_PRINT;
                 /* arg0 = the message entry (the host also has the call in its
                  * log). With a MSG table the text is formatted and handed to
                  * the host; error()/fatal() then stop the run, as the oracle
@@ -2386,17 +3018,25 @@ resume:
                                                    sizeof(txt), &lvl);
                         if (n < 0) return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
                         if (evm & ZBC_EV_MESSAGE)
-                            ev_message(L, fn_id == ZBC_BUILTIN_MESSAGE ? 0
+                            ev_message(L, info ? 0
                                        : fn_id == ZBC_BUILTIN_ERROR_MSG ? 1 : 2, lvl, txt, n);
                         if (L->host && L->host->message)
                             L->host->message(L->host->msg_ctx,
-                                fn_id == ZBC_BUILTIN_MESSAGE ? ZBC_MSG_SEV_INFO
+                                info ? ZBC_MSG_SEV_INFO
                                 : fn_id == ZBC_BUILTIN_ERROR_MSG ? ZBC_MSG_SEV_ERROR
                                 : ZBC_MSG_SEV_FATAL,
                                 fn_id == ZBC_BUILTIN_ERROR_MSG ? 0 : lvl, txt, (uint32_t)n);
+                        zbc_yield_t *ey = L->host ? L->host->yield : NULL;
+                        if (!info && ey && !ey->err_text[0]) {
+                            if (fn_id == ZBC_BUILTIN_ERROR_MSG)
+                                snprintf(ey->err_text, sizeof(ey->err_text), "error: %s", txt);
+                            else
+                                snprintf(ey->err_text, sizeof(ey->err_text),
+                                         "fatal (status %llu): %s", (unsigned long long)lvl, txt);
+                        }
                     }
                 }
-                if (fn_id != ZBC_BUILTIN_MESSAGE)
+                if (!info)
                     return halt(thread, L, ZBC_ERR_RUNTIME, in->op, 0);
                 L->pc++;
                 break;
@@ -2440,6 +3080,9 @@ resume:
             if (evm & ZBC_EV_IMPORT)
                 ev_import(L, fn_id, argv, nval, (in->flags & ZBC_F_BLOCKING) != 0,
                           (in->flags & ZBC_F_HAS_RET) && ret_slot != 0xFFFFFFFFu, rv);
+            if (!have_answer)   /* no host: a struct result reads 0s */
+                for (uint32_t i = 0; i < n_res; i++) L->results[i] = 0;
+            if ((in->imm & 0xFF) > 0) L->n_staged = 0;   /* staged args consumed */
             L->pc++;
             break;
         }
@@ -2510,7 +3153,7 @@ resume:
             return zsp_timebase_call(thread, &zbc_interp_task,
                                      L->img, (int)target, (zbc_result_t *)0,
                                      L->obj, L->base, L->spawn_budget, L->host,
-                                     fork_seed(L->seed_state, L->child_index++),
+                                     child_seed(L, target),
                                      (const uint64_t *)0, (uint32_t)0, L->run, (uint32_t)0,
                 L->act, L->node, L->comp, L->ar);
         }
@@ -2521,6 +3164,41 @@ resume:
             L->pc++;
             break;
         case ZBC_OP_LD_ARG: L->regs[a0] = L->call_args[a1]; L->pc++; break;
+        case ZBC_OP_LD_RES: L->regs[a0] = L->results[a1]; L->pc++; break;
+
+        /* COV_SAMPLE (F4.6b): covergroup a0 sampled with the a1 values staged
+         * by ARG (consumed). Binning is the host's, from the `cov` record. */
+        /* EXEC_SET (F5.4a): the frame's executor is now a0's value (an
+         * EXEC row id); the requests it issues carry it. */
+        case ZBC_OP_EXEC_SET:
+            L->executor = (uint32_t)L->regs[a0];
+            L->pc++;
+            break;
+
+        /* EXEC_GET (F5.4c): a0 = the frame's executor (0xFFFFFFFF = none:
+         * `executor()` is null). */
+        case ZBC_OP_EXEC_GET:
+            L->regs[a0] = L->executor;
+            L->pc++;
+            break;
+
+        case ZBC_OP_COV_SAMPLE: {
+            if (evm & ZBC_EV_COV) {
+                zbc_ev_sink_t *s = L->host->events;
+                zbc_ev_begin(s, "cov", L->ev_id,
+                             L->img->code[L->coro->code_start + L->pc].src_ref);
+                zbc_ev_map(s, 2);
+                zbc_ev_key(s, "covg"); zbc_ev_uint(s, a0);
+                zbc_ev_key(s, "values");
+                zbc_ev_list(s, a1);
+                for (uint32_t i = 0; i < a1; i++)
+                    zbc_ev_uint(s, i < L->n_staged ? L->staged[i] : 0);
+                zbc_ev_end(s);
+            }
+            L->n_staged = 0;
+            L->pc++;
+            break;
+        }
 
         case ZBC_OP_CALL: {
             /* A called function (B-D5): nested on this thread like a blocking
@@ -2591,6 +3269,7 @@ resume:
                     y->value = 0;
                     y->thread = thread;
                     y->frame = L;
+                    y->executor = L->executor;
                     y->pc = L->coro->code_start + L->pc;
                     y->state = ZBC_YIELD_PENDING;
                 }
@@ -2635,6 +3314,12 @@ resume:
         case ZBC_OP_RET: {
             uint64_t rv = (in->nargs > 0) ? L->regs[a0] : 0;
             if ((evm & ZBC_EV_CALL) && L->depth) ev_return(L, in->nargs > 0, rv);
+            if (L->called && L->n_staged) {
+                /* F6.4a: a struct result's leaves and the struct parameters'
+                 * copy-out, staged by ARG, go to the caller (LD_RES). */
+                memcpy(zsp_frame_locals(ret->prev, interp_locals_t)->results,
+                       L->staged, sizeof(L->staged));
+            }
             return halt(thread, L, ZBC_OK, 0, rv);
         }
 

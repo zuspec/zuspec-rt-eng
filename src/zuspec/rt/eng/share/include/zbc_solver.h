@@ -34,6 +34,15 @@ int zbc_solver_run(const void *problem_blob, uint64_t seed,
                    uint64_t *slots);
 
 /*
+ * zbc_solver_run with variable pin_var[i] fixed to pin_val[i] (an exported
+ * action's arguments, F2.3b); a value the constraints refuse is UNSAT.
+ */
+int zbc_solver_run_pinned(const void *problem_blob, uint64_t seed,
+                          const uint32_t *pairs, uint32_t n_pairs, uint64_t *slots,
+                          const uint32_t *pin_var, const int64_t *pin_val,
+                          uint32_t n_pins);
+
+/*
  * Solve an activation cone: compile `base`, add the blobs `adds[0..n_adds)`,
  * pin cone variable pin_var[i] to pin_val[i], solve with `seed`, and write the
  * value of cone variables 0..n_vals-1 to vals. Returns ZBC_SOLVER_* (a pin or
