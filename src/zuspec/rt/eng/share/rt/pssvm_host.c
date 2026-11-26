@@ -39,6 +39,9 @@ struct pssvm_s {
     zbc_dbg_t    dbg;           /* pssvm_dbg_*: breakpoints, pause, step */
     int          dbg_on;
     uint64_t     gen;           /* the generation, 1 at load; pssvm_reload adds one */
+    struct pssvm_call_s *trav;  /* the live action-entry call, or NULL: this
+                                 * engine runs one traversal at a time and
+                                 * refuses a second (pyvm queues it) */
     zsp_alloc_t  alloc;
     char         err[PSSVM_ERR_MAX];
 };
@@ -69,6 +72,7 @@ struct pssvm_call_s {
     zbc_obj_t       obj;        /* the action object (pssvm_call_start_obj) */
     uint64_t       *own_slots;  /* ... when pssvm_call_start allocated it */
     const char     *layout;     /* the action entry's object layout (JSON), or NULL */
+    int             traversal;  /* started on an action ENTRY (pssvm_s.trav) */
 };
 
 /* The host a run under `e` uses: the engine's messages, verbosity and import
@@ -101,11 +105,19 @@ static void call_host(pssvm_t *e, zbc_host_t *host, zbc_yield_t *y) {
 /* pssvm_error(NULL, NULL): why the last pssvm_load failed. */
 static char g_load_err[PSSVM_ERR_MAX];
 
+#define ZBC_STR_(x) #x
+#define ZBC_STR(x) ZBC_STR_(x)
+
 static const char *zbc_status_name(int st) {
     switch (st) {
     case ZBC_ERR_TOO_SMALL:      return "image too small";
     case ZBC_ERR_BAD_MAGIC:      return "bad magic";
-    case ZBC_ERR_BAD_VERSION:    return "bad format version";
+    case ZBC_ERR_BAD_VERSION:
+        return "bad format version (this engine reads .zbc " ZBC_STR(ZBC_VERSION_MAJOR)
+               ".x: rebuild the image)";
+    case ZBC_ERR_BAD_PROFILE:
+        return "the image needs an extension profile (or an opcode of one) this "
+               "engine does not implement";
     case ZBC_ERR_BAD_ABI:        return "bad ABI id";
     case ZBC_ERR_BAD_SECTIONS:   return "bad section table";
     case ZBC_ERR_NO_CODE:        return "no CODE section";
@@ -229,6 +241,16 @@ static int check_image(pssvm_t *e, char *err) {
     if (rc == ZBC_ERR_UNSUPPORTED_OP && halted == ZBC_HALT_ADDR_CLAIM) {
         set_err(err, PSSVM_E_IMAGE, 0, "image not runnable: address claims (the run's "
                 "claim ledger and contiguous placement) are not supported by the C engine yet (M14)");
+        return PSSVM_E_IMAGE;
+    }
+    if (rc == ZBC_ERR_UNSUPPORTED_OP && halted == ZBC_HALT_INFER) {
+        set_err(err, PSSVM_E_IMAGE, 0, "image not runnable: action inference (an inferred "
+                "stream partner) is not supported by the C engine yet (M14)");
+        return PSSVM_E_IMAGE;
+    }
+    if (rc == ZBC_ERR_UNSUPPORTED_OP && halted == ZBC_HALT_UID) {
+        set_err(err, PSSVM_E_IMAGE, 0, "image not runnable: action uid numbering is not "
+                "supported by the C engine yet (M14)");
         return PSSVM_E_IMAGE;
     }
     if (rc != ZBC_OK) {
@@ -705,6 +727,22 @@ pssvm_call_t *pssvm_call_start_obj(pssvm_t *e, const char *entry, const char *co
     int has_ret = 1;
     const zbc_entry *action = NULL;
     const char *layout = NULL;
+    const zbc_entry *own = find_entry(e, entry);
+    int traversal = own != NULL && own->kind == ZBC_ENTRY_ACTION;
+    if (traversal && e->trav != NULL && e->trav->state == CALL_READY) {
+        /* At most one traversal is active per engine (host-abi.md
+         * "Concurrent calls"). pyvm queues a second one until the first
+         * ends; this engine does not queue yet, so it refuses rather than
+         * run two activations over one tree. */
+        char esc[128], cur[96];
+        json_escape(esc, sizeof(esc), entry ? entry : "");
+        snprintf(cur, sizeof(cur), "%s", e->trav->call);
+        set_err(e->err, PSSVM_E_STATE, 0,
+                "cannot start traversal '%s': traversal '%s' is still active, "
+                "and the C engine does not queue a second traversal yet "
+                "(pyvm does); start it after the first ends", esc, cur);
+        return NULL;
+    }
     if (entry != NULL && entry[0] != 0) {
         const zbc_entry *found = find_entry(e, entry);
         if (found == NULL) {
@@ -763,6 +801,8 @@ pssvm_call_t *pssvm_call_start_obj(pssvm_t *e, const char *entry, const char *co
     h->yield.wait_time = 1;
     h->yield.wait_event = 1;
     h->seed = seed;
+    h->traversal = traversal;
+    if (traversal) e->trav = h;
     h->obj.slots = slots;
     h->obj.n = n_slots;
     h->layout = layout;
@@ -969,7 +1009,10 @@ int pssvm_run(pssvm_call_t *h) {
         r->status = PSSVM_REQS;
         r->req_id = ++h->next_req ? h->next_req : ++h->next_req;
         h->taken = 0;
-        r->api = y->kind == ZBC_YIELD_ACCESS ? PSSVM_API_MEM : PSSVM_API_USER;
+        /* a user import names its own API (IMPORT row; host-abi.md) */
+        r->api = y->kind == ZBC_YIELD_ACCESS ? PSSVM_API_MEM
+               : y->kind == ZBC_YIELD_BOUND ? PSSVM_API_USER
+               : zbc_image_import_api(&h->e->img, y->fn_id, PSSVM_API_USER);
         r->fn = y->kind == ZBC_YIELD_ACCESS ? (uint32_t)y->is_write : y->fn_id;
         r->thread = zbc_dbg_thread_id(h->e->dbg_on ? &h->e->dbg : NULL, y->thread);
         r->executor = y->executor;
@@ -1068,6 +1111,10 @@ static void set_call_err(pssvm_call_t *h) {
     char msg[2 * sizeof(h->yield.err_text)];
     if (h->yield.err_text[0])
         json_escape(msg, sizeof(msg), h->yield.err_text);
+    else if (h->yield.err_infer)
+        snprintf(msg, sizeof(msg), "%s (%d): the solve may need an inferred action, and "
+                 "action inference is not supported by the C engine yet (M14)",
+                 zbc_status_name(h->res.status), h->res.status);
     else
         snprintf(msg, sizeof(msg), "%s (%d)", zbc_status_name(h->res.status), h->res.status);
     snprintf(h->err, PSSVM_ERR_MAX,
@@ -1300,6 +1347,7 @@ int pssvm_call_status(pssvm_call_t *h, int *halted_op, uint64_t *now) {
 
 void pssvm_call_end(pssvm_call_t *h) {
     if (h == NULL) return;
+    if (h->e != NULL && h->e->trav == h) h->e->trav = NULL;
     if (h->tb != NULL)
         zsp_timebase_destroy(h->tb);   /* drops threads that never finished */
     free(h->own_slots);

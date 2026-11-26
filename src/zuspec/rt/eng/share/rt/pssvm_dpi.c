@@ -128,8 +128,20 @@ static void trace_to(pssvm_t *e, const char *opts, const char *image) {
     pssvm_set_events(e, s);
 }
 
+/* The engine this file loaded. The DPI state above (g_seed, the argument
+ * stage, the message queue) is process-global, not per engine (pssc
+ * pssvm-plan step 6 makes it per engine on pyvm; the C engine is on hold),
+ * so a second engine in one simulation would run with the first's seed and
+ * share its messages. It is refused instead. */
+static void *g_loaded;
+
 void *pssvm_dpi_load(const char *path, const char *opts) {
     g_dpi_err[0] = 0;
+    if (g_loaded != NULL) {
+        dpi_err("%s: the C engine runs one engine per simulation (its DPI "
+                "staging is process-global); load the image once", path);
+        return NULL;
+    }
     long n = 0;
     uint8_t *buf = read_image(path, &n);
     if (buf == NULL) return NULL;
@@ -148,6 +160,7 @@ void *pssvm_dpi_load(const char *path, const char *opts) {
     pssvm_set_host(e, &g_msg_host);
     trace_to(e, opts, path);
     remember_image(e, path);
+    g_loaded = e;
     return e;
 }
 

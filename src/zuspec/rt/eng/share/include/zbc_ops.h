@@ -19,9 +19,6 @@
 #define ZBC_OP_ST_LOCAL  0x13
 #define ZBC_OP_LD_FIELD  0x14
 #define ZBC_OP_ST_FIELD  0x15
-/* P1.5, component attributes: refused at load until P8. */
-#define ZBC_OP_LD_COMP   0x16
-#define ZBC_OP_ST_COMP   0x17
 /* A called (recursive) function's arguments (bc procedural gaps B-D5). */
 #define ZBC_OP_ARG       0x18   /* arg0 = rs; arg1 = i: stage argument i of the next CALL */
 #define ZBC_OP_LD_ARG    0x19   /* arg0 = rd; arg1 = i: this frame's argument i */
@@ -84,15 +81,10 @@
 #define ZBC_OP_PAR       0x42
 #define ZBC_OP_JOIN      0x43
 #define ZBC_OP_WAIT      0x44
-#define ZBC_OP_SELECT    0x45
 #define ZBC_OP_SOLVE     0x46
 #define ZBC_OP_BIND      0x47
 #define ZBC_OP_YIELD     0x48
 #define ZBC_OP_IMPORT    0x49
-/* P1.4 activation solve scope: NOT implemented natively until P8 -- an image
- * using either is refused before it runs (zbc_run). */
-#define ZBC_OP_SCOPE_ENTER 0x4A
-#define ZBC_OP_SOLVE_NODE  0x4B
 /* A recursive function: call coroutine arg0 now, nested, in this frame's object
  * and base, with the staged arguments; its RET value lands in arg1
  * (0xFFFFFFFF: none). */
@@ -102,12 +94,25 @@
  * procedural SOLVE (ZBC_SOLVE_PROCEDURAL) into register arg0. */
 #define ZBC_OP_SOLVE_PIN   0x4D
 #define ZBC_OP_SOLVE_GET   0x4E
+
+/* The pss extension (0x80-0xBF; the image sets ZBC_HDR_EXT_PSS). */
+#define ZBC_OP_SELECT      0x80
+/* P1.4 activation solve scope. */
+#define ZBC_OP_SCOPE_ENTER 0x81
+#define ZBC_OP_SOLVE_NODE  0x82
 /* Functional coverage (F4.4): sample covergroup arg0 (the image's COVG entry)
  * with the coverpoint values (and iff flags) in registers arg1... Not
  * implemented by this engine: an image using it is refused (M14). */
-#define ZBC_OP_COV_SAMPLE  0x4F
-#define ZBC_OP_EXEC_SET    0x50   /* F5.4a: frame executor = EXEC row in a0 */
-#define ZBC_OP_EXEC_GET    0x51   /* F5.4c: a0 = frame executor (~0 = none) */
+#define ZBC_OP_COV_SAMPLE  0x83
+#define ZBC_OP_EXEC_SET    0x84   /* F5.4a: frame executor = EXEC row in a0 */
+#define ZBC_OP_EXEC_GET    0x85   /* F5.4c: a0 = frame executor (~0 = none) */
+/* P1.5, component attributes. */
+#define ZBC_OP_LD_COMP     0x86
+#define ZBC_OP_ST_COMP     0x87
+
+/* The extensions this engine implements (zbc_format.h ZBC_HDR_EXT_*): an
+ * image declaring another is refused at load (ZBC_ERR_BAD_PROFILE). */
+#define ZBC_ENGINE_EXTENSIONS ZBC_HDR_EXT_PSS
 
 /* IMPORT fn_ids at and above this are interpreter builtins (model.BUILTIN_*). */
 #define ZBC_BUILTIN_BASE      0xFFFFFF00u

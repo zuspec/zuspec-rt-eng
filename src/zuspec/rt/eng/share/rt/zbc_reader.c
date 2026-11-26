@@ -7,6 +7,7 @@
  * big-endian swap path is a later concern [D§3a]).
  */
 #include "zbc_reader.h"
+#include "zbc_ops.h"
 #include <string.h>
 
 static int in_bounds(const zbc_image_t *img, uint64_t off, uint64_t len) {
@@ -242,6 +243,9 @@ int zbc_image_open(zbc_image_t *img, const void *data, size_t size) {
     }
     if (h->abi_id != ZBC_ENGINE_ABI_ID) {
         return ZBC_ERR_BAD_ABI;
+    }
+    if (h->flags & ZBC_HDR_EXT_MASK & ~(uint32_t)ZBC_ENGINE_EXTENSIONS) {
+        return ZBC_ERR_BAD_PROFILE;    /* an extension this engine lacks */
     }
 
     /* Section directory. */
@@ -621,7 +625,7 @@ const char *zbc_image_meta(const zbc_image_t *img, const char *name) {
     return NULL;
 }
 
-const char *zbc_image_import_name(const zbc_image_t *img, uint32_t fn_id) {
+static const zbc_impent *import_row(const zbc_image_t *img, uint32_t fn_id) {
     uint32_t lo = 0, hi = img->import_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
@@ -629,7 +633,17 @@ const char *zbc_image_import_name(const zbc_image_t *img, uint32_t fn_id) {
         else hi = mid;
     }
     return (lo < img->import_count && img->imports[lo].fn_id == fn_id)
-           ? zbc_image_str(img, img->imports[lo].name) : NULL;
+           ? &img->imports[lo] : NULL;
+}
+
+const char *zbc_image_import_name(const zbc_image_t *img, uint32_t fn_id) {
+    const zbc_impent *r = import_row(img, fn_id);
+    return r ? zbc_image_str(img, r->name) : NULL;
+}
+
+uint32_t zbc_image_import_api(const zbc_image_t *img, uint32_t fn_id, uint32_t dflt) {
+    const zbc_impent *r = import_row(img, fn_id);
+    return r && r->api != 0xFFFFFFFFu ? r->api : dflt;   /* ~0: no API row */
 }
 
 const zbc_regent *zbc_image_reg_at(const zbc_image_t *img, uint32_t pc) {

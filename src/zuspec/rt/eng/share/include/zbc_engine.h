@@ -38,6 +38,10 @@ int zbc_run(const void *data, size_t size,
 /* *halted_op for an image whose activation nodes claim addresses (no
  * opcode names it; the C engine has no address ledger until M14). */
 #define ZBC_HALT_ADDR_CLAIM 0x10000
+/* ... whose activations need an inferred stream partner (M9a6b; none runs here until M14). */
+#define ZBC_HALT_INFER      0x10001
+/* ... whose activations number uid slots (actinit unknown == 2; M14). */
+#define ZBC_HALT_UID        0x10002
 int  zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_op);
 void zbc_drain(zsp_timebase_t *tb, zbc_image_t *img, zbc_result_t *out);
 /* zbc_drain that stops (returning 1) when `y` holds a pending request, or a

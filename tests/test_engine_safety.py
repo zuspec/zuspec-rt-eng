@@ -16,6 +16,7 @@ from conftest import run_image
 
 # Error codes (mirror zbc_reader.h).
 ZBC_ERR_UNSUPPORTED_OP = -8
+ZBC_ERR_BAD_PROFILE    = -29
 ZBC_ERR_OOB_REG        = -10
 ZBC_ERR_BAD_TARGET     = -12
 ZBC_ERR_STEP_LIMIT     = -13
@@ -150,12 +151,38 @@ def test_unknown_opcode_is_refused_before_anything_runs(eng):
     from zuspec.be.bc.format.writer import write_image
     from conftest import make_import_host
     imp = Instr(Op.IMPORT, args=(0, 0xFFFFFFFF))
-    image = _patched([imp, Instr(Op.NOP), Instr(Op.RET)], 1, 0xEE)
+    image = _patched([imp, Instr(Op.NOP), Instr(Op.RET)], 1, 0x7E)
     host, read_calls = make_import_host()
     res = run_image(eng, write_image(image), host=host)
     assert res.status == ZBC_ERR_UNSUPPORTED_OP
-    assert res.halted_op == 0xEE
+    assert res.halted_op == 0x7E
     assert list(read_calls()) == []
+
+
+@pytest.mark.parametrize("op", [0xEE, int(Op.SCOPE_ENTER)])
+def test_an_extension_opcode_the_image_does_not_declare_is_refused(eng, op):
+    """An opcode in an extension's range (0x80 up) needs the extension's
+    header flag (zbc-format.md "Profiles"): 0xEE is in no extension this
+    engine has, and the pss image's flag is cleared here."""
+    from zuspec.be.bc.format.writer import write_image
+    from conftest import make_import_host
+    imp = Instr(Op.IMPORT, args=(0, 0xFFFFFFFF))
+    image = _patched([imp, Instr(Op.NOP), Instr(Op.RET)], 1, op)
+    image.extensions = 0
+    host, read_calls = make_import_host()
+    res = run_image(eng, write_image(image), host=host)
+    assert res.status == ZBC_ERR_BAD_PROFILE
+    assert res.halted_op == op
+    assert list(read_calls()) == []
+
+
+def test_an_extension_the_engine_does_not_implement_is_refused_at_load(eng):
+    from zuspec.be.bc.format.writer import write_image
+    code = [Instr(Op.CONST, args=(0,), imm=7), Instr(Op.RET, args=(0,))]
+    image = ZbcModel(coros=[CoroDescriptor(name="main", code=code, blocks=[])],
+                     entry_coro=0).to_container()
+    image.extensions = 0x0200
+    assert run_image(eng, write_image(image)).status == ZBC_ERR_BAD_PROFILE
 
 
 def test_an_unknown_section_is_skipped(eng):

@@ -187,6 +187,11 @@ typedef struct {
     uint32_t  err_cone;
     uint32_t  err_nen;
     uint32_t  err_en[ZBC_CALL_MAX_ARGS + ZBC_SOLVE_MAX_INPUTS];
+    /* 1: that unsat cone holds INFER constraints, which this engine never
+     * puts in force (no inferred node runs until M14): pyvm may well solve
+     * it by inferring an action, so the failure is the engine's, not the
+     * model's, and the host says so. */
+    uint32_t  err_infer;
     /* F6.11f: when error()/fatal() stopped the run, its text as pyvm's
      * VMError has it ("error: <text>", "fatal (status N): <text>"); else "". */
     char      err_text[256];

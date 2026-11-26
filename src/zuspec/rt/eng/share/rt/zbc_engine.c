@@ -117,6 +117,58 @@ static int act_claims_addrs(const zbc_image_t *img) {
     return 0;
 }
 
+/* Skip a u32-list group block of the form n, then per entry (ref string,
+ * m, m (instance, k, k hidden node ids)) and return the index after it, or
+ * 0 when it runs past the list. */
+static uint32_t act_skip_infer_groups(const zbc_image_t *img, uint32_t i, uint32_t *n_hidden) {
+    const zbc_acttab *t = img->acttab;
+    if (i >= t->n_u32) return 0;
+    uint32_t n = img->actlist[i++];
+    for (uint32_t e = 0; e < n; e++) {
+        if (i + 2 > t->n_u32) return 0;
+        uint32_t m = img->actlist[i + 1];
+        i += 2;
+        for (uint32_t g = 0; g < m; g++) {
+            if (i + 2 > t->n_u32) return 0;
+            uint32_t k = img->actlist[i + 1];
+            *n_hidden += k;
+            i += 2 + k;
+        }
+    }
+    return i;
+}
+
+/* An activation of img has a stream reference whose partner must be
+ * inferred (sinfer0's second block, M9a6b). Unlike an inferred buffer
+ * producer or state writer, which pyvm adds only when the solve needs one
+ * (the C engine then fails that solve, saying inference is what it lacks,
+ * pssvm_host.c err_infer), an unpaired stream always needs its partner, and
+ * without it the run would end with the sender's output unconsumed and no
+ * error. The C engine runs no inferred node until M14, so it refuses. */
+static int act_infers_streams(const zbc_image_t *img) {
+    const zbc_acttab *t = img->acttab;
+    if (!t) return 0;
+    for (uint32_t i = 0; i < t->n_nodes; i++) {
+        uint32_t s0 = img->actnodes[i].sinfer0, hidden = 0;
+        if (!s0) continue;
+        uint32_t j = act_skip_infer_groups(img, s0, &hidden);   /* state writers */
+        hidden = 0;
+        if (!j || !act_skip_infer_groups(img, j, &hidden) || hidden) return 1;
+    }
+    return 0;
+}
+
+/* An activation of img has uid slots (actinit unknown == 2): the Python
+ * engine numbers them at activation and on each re-traversal; the C engine
+ * does not until M14 and would leave every uid 0. Refused instead. */
+static int act_numbers_uids(const zbc_image_t *img) {
+    const zbc_acttab *t = img->acttab;
+    if (!t) return 0;
+    for (uint32_t i = 0; i < t->n_init; i++)
+        if (img->actinits[i].unknown == 2) return 1;
+    return 0;
+}
+
 /* An opcode the interpreter has a case for (zbc_interp.c). PAR has none: no
  * lowering emits it, and the Python engine rejects it too. */
 static int op_known(uint32_t op) {
@@ -168,6 +220,14 @@ int zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_
      * constraints, initializers or component state would not hold (P1-D6). */
     for (uint32_t i = 0; i < img->code_count; i++) {
         uint32_t op = img->code[i].op;
+        /* An extension's opcode in an image that does not declare it
+         * (zbc-format.md "Profiles"). */
+        if (op > ZBC_OP_CORE_LAST
+                && !(op >= ZBC_OP_PSS_FIRST && op <= ZBC_OP_PSS_LAST
+                     && (img->hdr->flags & ZBC_HDR_EXT_PSS))) {
+            *halted_op = (int)op;
+            return ZBC_ERR_BAD_PROFILE;
+        }
         /* file_read* / file_write_lines make or read heap values: refused as the heap. */
         int heap_file = (op == ZBC_OP_IMPORT && img->code[i].arg0 >= ZBC_BUILTIN_FILE_READ
                 && img->code[i].arg0 <= ZBC_BUILTIN_FILE_WRITE_LINES)
@@ -191,6 +251,14 @@ int zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_
     }
     if (act_claims_addrs(img)) {
         *halted_op = ZBC_HALT_ADDR_CLAIM;
+        return ZBC_ERR_UNSUPPORTED_OP;
+    }
+    if (act_infers_streams(img)) {
+        *halted_op = ZBC_HALT_INFER;
+        return ZBC_ERR_UNSUPPORTED_OP;
+    }
+    if (act_numbers_uids(img)) {
+        *halted_op = ZBC_HALT_UID;
         return ZBC_ERR_UNSUPPORTED_OP;
     }
     return ZBC_OK;

@@ -1525,6 +1525,9 @@ static int act_pick(interp_locals_t *L, uint32_t ci, const uint8_t *en,
         times = nxt + 1;
     }
     rc = ZBC_ERR_SOLVE_UNSAT;   /* no object output so far satisfies the input */
+    /* ... where pyvm would infer a producer (M9a3), which this engine does
+     * not run until M14: say so (pssvm_host.c). */
+    if (pk->n_infer && L->host && L->host->yield) L->host->yield->err_infer = 1;
 out:
     free(pools); free(perm);
     return rc;
@@ -1865,6 +1868,9 @@ static void note_cone_unsat(interp_locals_t *L, uint32_t ci, const uint8_t *en, 
                             const uint32_t *pin_var, const int64_t *pin_val, uint32_t npin) {
     if (!L->run || L->run->status != ZBC_OK || !L->host || !L->host->yield || !L->act) return;
     zbc_yield_t *y = L->host->yield;
+    const zbc_actcone *cone = zbc_act_cone(L->img, L->act, ci);
+    for (uint32_t i = 0; cone && i < cone->n_cons; i++)
+        if (zbc_act_con(L->img, cone->con0 + i)->kind == 4) y->err_infer = 1;
     uint32_t max = (uint32_t)(sizeof(y->err_en) / sizeof(y->err_en[0])), ne = 0;
     for (uint32_t i = 0; i < nc; i++) ne += en[i] != 0;
     if (ne > max || npin > max) return;
@@ -2002,6 +2008,109 @@ static zsp_frame_t *halt(zsp_thread_t *thread, interp_locals_t *L,
         return r;
     }
     return zsp_timebase_return(thread, rv);
+}
+
+/* Static def/use of a statement, for its `stmt` event (be-bc
+ * interp/defuse.py, the oracle's): the values the code from its start pc to
+ * the next statement's start loads (uses) and stores (defs), each a token in
+ * first-seen order without repeats. `l:<name>` a named local in scope (else
+ * `l#<slot>`), `a#<i>` an argument, `f#<slot>` a field of the frame's
+ * object, `c#<slot>` a component field made absolute by the frame's cbase
+ * (defuse.abs_comp). Branches inside the range are ignored. */
+typedef struct {
+    char        kind;       /* 'l', 'a', 'f', 'c' */
+    uint64_t    slot;
+    const char *name;       /* a named local's name, else NULL */
+} du_tok_t;
+
+typedef struct {
+    du_tok_t *v;
+    uint32_t  n, cap;
+} du_list_t;
+
+static int du_same(const du_tok_t *a, const du_tok_t *b) {
+    if (a->kind != b->kind) return 0;
+    if (a->name || b->name)
+        return a->name && b->name && strcmp(a->name, b->name) == 0;
+    return a->slot == b->slot;
+}
+
+static void du_add(du_list_t *l, du_tok_t t) {
+    for (uint32_t i = 0; i < l->n; i++)
+        if (du_same(&l->v[i], &t)) return;
+    if (l->n == l->cap) {
+        uint32_t cap = l->cap ? l->cap * 2 : 8;
+        du_tok_t *v = realloc(l->v, cap * sizeof(*v));
+        if (!v) return;
+        l->v = v;
+        l->cap = cap;
+    }
+    l->v[l->n++] = t;
+}
+
+/* The name of local `slot` in scope at global pc `pc` of coroutine `ci`. */
+static const char *du_local_name(const zbc_image_t *img, uint32_t ci,
+                                 uint32_t slot, uint32_t pc) {
+    for (uint32_t i = 0; i < img->local_count; i++) {
+        const zbc_localent *v = &img->locals[i];
+        if (v->coro == ci && v->slot == slot && v->pc_start <= pc && pc < v->pc_end)
+            return zbc_image_str(img, v->name);
+    }
+    return NULL;
+}
+
+/* defs and uses of the statement starting at global pc `start` of the
+ * frame's coroutine. */
+static void du_collect(const interp_locals_t *L, uint32_t start,
+                       du_list_t *defs, du_list_t *uses) {
+    const zbc_image_t *img = L->img;
+    uint32_t cs = L->coro->code_start, ce = cs + L->coro->code_count;
+    uint32_t ci = (uint32_t)(L->coro - img->coros);
+    uint32_t end = ce;
+    for (uint32_t i = 0; i < img->stmt_count; i++) {
+        uint32_t p = img->stmts[i].pc_start;
+        if (p > start && p < ce) { end = p; break; }
+    }
+    for (uint32_t pc = start; pc < end && pc < img->code_count; pc++) {
+        const zbc_instr *in = &img->code[pc];
+        du_list_t *l;
+        char k;
+        switch (in->op) {
+        case ZBC_OP_LD_LOCAL: l = uses; k = 'l'; break;
+        case ZBC_OP_LD_ARG:   l = uses; k = 'a'; break;
+        case ZBC_OP_LD_FIELD: l = uses; k = 'f'; break;
+        case ZBC_OP_LD_COMP:  l = uses; k = 'c'; break;
+        case ZBC_OP_ST_LOCAL: l = defs; k = 'l'; break;
+        case ZBC_OP_ST_FIELD: l = defs; k = 'f'; break;
+        case ZBC_OP_ST_COMP:  l = defs; k = 'c'; break;
+        default: continue;
+        }
+        du_tok_t t = { k, in->arg1, NULL };
+        if (k == 'l') t.name = du_local_name(img, ci, in->arg1, pc);
+        if (k == 'c') t.slot = (uint64_t)L->cbase + in->arg1;   /* abs_comp */
+        du_add(l, t);
+    }
+}
+
+static void du_emit(zbc_ev_sink_t *s, const du_list_t *l) {
+    zbc_ev_list(s, l->n);
+    for (uint32_t i = 0; i < l->n; i++) {
+        const du_tok_t *t = &l->v[i];
+        char buf[64];
+        if (t->name) {
+            size_t n = strlen(t->name);
+            char *p = n + 3 <= sizeof(buf) ? buf : malloc(n + 3);
+            if (!p) { zbc_ev_str(s, "", 0); continue; }
+            p[0] = 'l'; p[1] = ':';
+            memcpy(p + 2, t->name, n);
+            zbc_ev_str(s, p, n + 2);
+            if (p != buf) free(p);
+        } else {
+            int n = snprintf(buf, sizeof(buf), "%c#%llu", t->kind,
+                             (unsigned long long)t->slot);
+            zbc_ev_str(s, buf, (size_t)n);
+        }
+    }
 }
 
 /* A node whose instance its solve has not chosen yet (pyvm frame.comp None);
@@ -2267,22 +2376,37 @@ resume:
                 const char *path = cv ? zbc_image_str(L->img, cv->path) : NULL;
                 const char *scope = cv ? zbc_image_str(L->img, cv->scope) : NULL;
                 int has_scope = scope && *scope;
+                /* + defs and uses (interp/defuse.py) */
+                du_list_t defs = {0}, uses = {0};
+                if (ns) du_collect(L, L->coro->code_start + L->pc, &defs, &uses);
                 for (uint32_t i = 0; i < ns; i++) {
                     zbc_ev_sink_t *s = L->host->events;
                     zbc_ev_begin(s, "stmt", L->ev_id, st[i].src_ref);
-                    zbc_ev_map(s, 1u + (path ? 1u : 0u) + (uint32_t)has_scope);
-                    zbc_ev_key(s, "pc");
-                    zbc_ev_uint(s, L->pc);
+                    zbc_ev_map(s, 1u + (path ? 1u : 0u) + (uint32_t)has_scope
+                                  + (defs.n ? 1u : 0u) + (uses.n ? 1u : 0u));
+                    /* keys in sorted order: defs, path, pc, scope, uses */
+                    if (defs.n) {
+                        zbc_ev_key(s, "defs");
+                        du_emit(s, &defs);
+                    }
                     if (path) {
                         zbc_ev_key(s, "path");
                         zbc_ev_str(s, path, strlen(path));
                     }
+                    zbc_ev_key(s, "pc");
+                    zbc_ev_uint(s, L->pc);
                     if (has_scope) {
                         zbc_ev_key(s, "scope");
                         zbc_ev_str(s, scope, strlen(scope));
                     }
+                    if (uses.n) {
+                        zbc_ev_key(s, "uses");
+                        du_emit(s, &uses);
+                    }
                     zbc_ev_end(s);
                 }
+                free(defs.v);
+                free(uses.v);
             }
         }
         if ((evm & ZBC_EV_BRANCH) && !ev_again) {

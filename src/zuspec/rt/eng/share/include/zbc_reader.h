@@ -49,7 +49,9 @@ enum {
     ZBC_ERR_RUNTIME      = -25,  /* BUILTIN_ERROR: a run-time error the LRM requires */
     ZBC_ERR_OOB_COMP     = -26,  /* LD/ST_COMP slot >= component object slot count */
     ZBC_ERR_DEADLOCK     = -27,  /* every thread spins on a channel and nothing timed is left */
-    ZBC_ERR_COMP_UNCHOSEN = -28  /* LD/ST_COMP before the solve chose the action's instance */
+    ZBC_ERR_COMP_UNCHOSEN = -28, /* LD/ST_COMP before the solve chose the action's instance */
+    ZBC_ERR_BAD_PROFILE  = -29   /* an extension this engine does not implement, or an
+                                  * opcode of one the image does not declare */
 };
 
 typedef struct {
@@ -196,6 +198,8 @@ const zbc_section *zbc_find_section(const zbc_image_t *img, uint32_t kind);
 const char *zbc_image_meta(const zbc_image_t *img, const char *name);
 /* The name of user import `fn_id`, or NULL (not in the IMPORT table). */
 const char *zbc_image_import_name(const zbc_image_t *img, uint32_t fn_id);
+/* The API id of import `fn_id` (its IMPORT row), or `dflt` without one. */
+uint32_t zbc_image_import_api(const zbc_image_t *img, uint32_t fn_id, uint32_t dflt);
 /* The REG entry of the access at global pc `pc`, or NULL. */
 const zbc_regent *zbc_image_reg_at(const zbc_image_t *img, uint32_t pc);
 /* The CHAN entry of the operation ending at global pc `pc`, or NULL. */

@@ -186,14 +186,25 @@ def _irq_model():
     return model
 
 
-def _steps(call):
-    """Run `call` to its end: each status, and a notify at the first WAIT EVENT."""
+def _irq_c(call):
+    call.notify(nhost.N_IRQ, 3)
+
+
+def _irq_py(call):
+    # pyvm: an interrupt is a call of the handler, an exported function
+    # (be-bc host-abi.md "Concurrent calls"); the C engine keeps N_IRQ
+    pyhost.run_sync(call.start_function("irq"))
+
+
+def _steps(call, irq=_irq_c):
+    """Run `call` to its end: each status, and an interrupt at the first
+    WAIT EVENT."""
     seen = []
     while True:
         r = call.run()
         seen.append((r.status_name, r.on if r.status == nhost.WAIT else None))
         if r.status == nhost.WAIT and r.on == "EVENT" and len(seen) == 1:
-            call.notify(nhost.N_IRQ, 3)
+            irq(call)
             continue
         if r.status != nhost.WAIT:
             return seen, (call.result if r.status == nhost.DONE else r.error)
@@ -202,8 +213,8 @@ def _steps(call):
 def test_an_irq_wakes_a_call_waiting_on_an_event_alike(_rawlib):
     model = _irq_model()
     vm = VM(model, out=lambda l: None)
-    py = pyhost.HostCall(vm, vm.root_frame(model.entry_coro, 0), irq_entry=2)
-    want = _steps(py)
+    py = pyhost.HostCall(vm, vm.root_frame(model.entry_coro, 0))
+    want = _steps(py, _irq_py)
     py.end()
     assert want == ([("WAIT", "EVENT"), ("DONE", None)], 12)
     with nhost.Engine(_rawlib, model.to_bytes()) as eng:
@@ -239,7 +250,7 @@ def test_an_irq_without_a_handler_or_a_bad_handler_is_an_error(_rawlib):
         call.end()
 
 
-def _platform(engine, lib, model, drive, mem=None, prov=None, irq=None):
+def _platform(engine, lib, model, drive, mem=None, prov=None, irq=False):
     """The platform side (be-bc ``events.platform_side``) of a run of
     `model` on `engine`, recorded under the ``platform`` mask; `drive`
     runs the call."""
@@ -250,14 +261,13 @@ def _platform(engine, lib, model, drive, mem=None, prov=None, irq=None):
         vm = VM(model, memory=mem, import_provider=prov, out=lambda l: None,
                 events=sink)
         vm.watch(ev.EV_PLATFORM)
-        call = pyhost.HostCall(vm, vm.root_frame(model.entry_coro, 0),
-                               irq_entry=irq)
+        call = pyhost.HostCall(vm, vm.root_frame(model.entry_coro, 0))
         drive(call)
         return ev.platform_side(sink.events)
     buf = []
     with nhost.Engine(lib, model.to_bytes()) as eng:
         eng.trace(buf.append, ev.EV_PLATFORM)
-        if irq is not None:
+        if irq:
             eng.set_irq("irq")
         drive(eng.call())
     return ev.platform_side(binary.read(b"".join(buf))[2])
@@ -281,14 +291,16 @@ def test_both_engines_record_the_same_platform_side(_rawlib):
     assert sides[0][1] == ("import", 42, 0xABCD + 1000)
     assert sides[0][2] == ("import", 7, None)
 
+    # an interrupt: a notification on the C engine; on pyvm a call of the
+    # handler, which is no notification (the C engine may lag; pssvm-plan)
     irq = []
     for engine in ("py", "c"):
         def drive(call):
-            _steps(call)
+            _steps(call, _irq_py if engine == "py" else _irq_c)
             call.end()
-        irq.append(_platform(engine, _rawlib, _irq_model(), drive, irq=2))
-    assert irq[0] == irq[1] == [
-        ("notify", {"irq": 3, "value": 0, "delivered": True})]
+        irq.append(_platform(engine, _rawlib, _irq_model(), drive, irq=True))
+    assert irq[0] == []
+    assert irq[1] == [("notify", {"irq": 3, "value": 0, "delivered": True})]
 
 
 def test_a_notification_with_no_handler_is_recorded_undelivered(_rawlib):
@@ -321,3 +333,27 @@ def test_an_action_entry_reads_and_writes_its_own_object(_rawlib):
         assert call.obj == [10, 0]
         with pytest.raises(nhost.NativeError):
             nhost.run_sync(eng.call("act"))       # no object: LD_FIELD fails
+
+
+def test_a_second_traversal_is_refused_while_one_is_active(_rawlib):
+    # pssvm-plan step 5: one traversal at a time. pyvm queues a second one
+    # (WAIT TURN); this engine does not queue yet and refuses it at start
+    # rather than run two activations over one tree.
+    from zuspec.be.bc.model import EntryPoint
+    model = _code_model([Instr(Op.WAIT, imm=10), Instr(Op.RET)])
+    model.entries = {"act": EntryPoint(coro=0, kind="action"),
+                     "fn": EntryPoint(coro=0, kind="function")}
+    with nhost.Engine(_rawlib, model.to_bytes()) as eng:
+        a = eng.call("act")
+        assert a.run().status_name == "WAIT"
+        with pytest.raises(nhost.NativeError,
+                           match="traversal 'act' is still active.*does not "
+                                 "queue a second traversal"):
+            eng.call("act")
+        f = eng.call("fn")                         # a function call is fine
+        f.end()
+        nhost.run_sync(a, None, None)              # DONE frees the slot
+        b = eng.call("act")
+        b.end()
+        a.end()
+        eng.call("act").end()

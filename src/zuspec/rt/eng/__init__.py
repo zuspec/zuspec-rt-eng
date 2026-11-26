@@ -26,6 +26,13 @@ def rt_dir() -> str:
     return os.path.join(SHARE_DIR, "rt")
 
 
+def sv_dir() -> str:
+    """Absolute path to the engine's SV directory: ``zsp_rt_bc_pkg.sv``,
+    the C engine's variant of zuspec-be-bc's ``zsp_rt_bc_pkg`` (compile it
+    with be-bc's ``share/sv`` on +incdir)."""
+    return os.path.join(SHARE_DIR, "sv")
+
+
 def source_files() -> list:
     """Absolute paths of the engine C sources (sorted, stable)."""
     return sorted(glob.glob(os.path.join(rt_dir(), "*.c")))
