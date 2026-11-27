@@ -418,6 +418,7 @@ int zbc_image_open(zbc_image_t *img, const void *data, size_t size) {
         img->reg_count = reg_sec->count;
     }
     const zbc_section *exec_sec = zbc_find_section(img, ZBC_SEC_EXEC);
+    img->exec_default = 0xFFFFFFFFu;
     if (exec_sec && exec_sec->size) {
         if (img->strb == NULL || !in_bounds(img, exec_sec->offset, exec_sec->size)
                 || exec_sec->size < sizeof(zbc_exectab))
@@ -433,6 +434,8 @@ int zbc_image_open(zbc_image_t *img, const void *data, size_t size) {
         }
         img->execs = x;
         img->exec_count = t->n_exec;
+        if (t->default_exec && t->default_exec <= t->n_exec)
+            img->exec_default = t->default_exec - 1;
     }
     const zbc_section *evt_sec = zbc_find_section(img, ZBC_SEC_EVENT);
     if (evt_sec && evt_sec->count) {

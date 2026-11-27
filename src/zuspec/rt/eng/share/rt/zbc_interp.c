@@ -2251,9 +2251,11 @@ zsp_frame_t *zbc_interp_task(zsp_timebase_t *tb, zsp_thread_t *thread,
         L->comp = va_arg(*args, uint32_t);
         L->ar = va_arg(*args, zbc_actrun_t *);
         /* A called frame inherits its caller's executor; a spawned thread's
-         * spawner sets it after the create. */
+         * spawner sets it after the create; a root frame starts on the
+         * default executor. */
         L->executor = ret->prev && ret->prev->func == &zbc_interp_task
-            ? zsp_frame_locals(ret->prev, interp_locals_t)->executor : 0xFFFFFFFFu;
+            ? zsp_frame_locals(ret->prev, interp_locals_t)->executor
+            : L->img->exec_default;
         L->called = ret->prev && ret->prev->func == &zbc_interp_task
             && zsp_frame_locals(ret->prev, interp_locals_t)->sync_call;
         int is_root = L->node == 0xFFFFFFFEu;

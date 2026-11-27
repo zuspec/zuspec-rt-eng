@@ -151,5 +151,6 @@
 #define ZBC_F_INITED     0x10   /* INVOKE: callee starts at arg3 (P1.4; refused) */
 #define ZBC_F_SPIN       0x20   /* YIELD: waiting on a condition (channel get/put) */
 #define ZBC_F_SUBSET     0x40   /* JOIN: join_select / join_branch (refused until M14) */
+#define ZBC_F_AT         0x80   /* CALL: callee runs in instance imm (pss_top, executor handles; refused) */
 
 #endif /* ZUSPEC_ZBC_OPS_H */

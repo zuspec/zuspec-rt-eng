@@ -131,6 +131,9 @@ typedef struct {
      * executor id requests carry. zbc_image_open has checked the StrIds. */
     const zbc_execent *execs;
     uint32_t           exec_count;
+    /* The default executor's id: every root frame starts on it (an inferred
+     * one when the model names none; pssvm 8e). 0xFFFFFFFF if absent. */
+    uint32_t           exec_default;
     /* Optional host-fed channels (EVENT, F5.5a; NULL/0 if absent): row i is
      * the id notify(N_CHAN) names. zbc_image_open has checked the StrIds. */
     const zbc_evtent  *events;

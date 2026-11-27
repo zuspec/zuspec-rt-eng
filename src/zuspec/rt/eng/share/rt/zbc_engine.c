@@ -241,6 +241,9 @@ int zbc_image_check(const zbc_image_t *img, const zbc_host_t *host, int *halted_
                 || ((op == ZBC_OP_LD_COMP || op == ZBC_OP_ST_COMP) && img->comp == NULL)
                 /* join_select / join_branch (F8 M8b1): the Python engine's alone until M14. */
                 || (op == ZBC_OP_JOIN && (img->code[i].flags & ZBC_F_SUBSET))
+                /* A CALL into another instance (pss_top, an executor handle): the
+                   Python engine's alone. */
+                || (op == ZBC_OP_CALL && (img->code[i].flags & ZBC_F_AT))
                 /* Platform memory (B-D6): only a host with mem_access answers it. */
                 || (op == ZBC_OP_IMPORT && (host == NULL || (host->mem_access == NULL && host->yield == NULL))
                     && img->code[i].arg0 >= ZBC_BUILTIN_MEM_FIRST
