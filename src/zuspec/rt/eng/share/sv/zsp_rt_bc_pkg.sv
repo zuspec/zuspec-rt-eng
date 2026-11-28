@@ -14,8 +14,9 @@
 //
 // Load options (`opts`, comma-separated) are the C engine's: root=<type>,
 // seed=<n>, seed_mode=keyed|stream, trace=<file>, trace_mask=<n>,
-// verbosity=<n>, step_limit=<n>; +pss_seed / +pss_seed_mode win. Any other
-// option (pyvm's platform=, ...) is ignored and reported.
+// verbosity=<n>, step_limit=<n>; and dbg_signal=1, dbg_start=1, served in
+// SV. Any other option (pyvm's platform=, ...) is ignored and reported.
+// The package reads no plusargs: its host passes every option.
 //
 // `class zsp_rt_bc` overrides what the C engine serves. Every other method
 // of the list (zuspec-be-bc rt_bc_api.py) is zsp_rt_bc_base's: a refusal
@@ -91,7 +92,8 @@ package zsp_rt_bc_pkg;
       string known[$] = '{"root", "seed", "seed_mode", "trace", "trace_mask",
                           "verbosity", "step_limit"};
       zsp_rt_bc eng = new();
-      opts = zsp_rt_bc_plusarg_opts(opts);
+      bit dbg_start;
+      zsp_rt_bc_sv_opts(opts, dbg_start);
       zsp_rt_bc_check_opts("the C engine", opts, known);
       eng.root_type = opt_value(opts, "root");
       eng.e = pssvm_dpi_load(img, opts);
@@ -103,8 +105,15 @@ package zsp_rt_bc_pkg;
         $display("PSSVM-ERROR: load %s: %s", img, pssvm_dpi_error(null, null));
         return null;
       end
-      zsp_rt_bc_loaded(eng);
+      zsp_rt_bc_loaded(eng, dbg_start);
       return eng;
+    endfunction
+
+    // The root component type image `img` loads by default, read without
+    // loading it: "" here, as the C engine has no such query yet (a host
+    // names the engine itself).
+    static function string image_root(string img);
+      return "";
     endfunction
 
     // The value of option `key` in `opts` ("" when absent).

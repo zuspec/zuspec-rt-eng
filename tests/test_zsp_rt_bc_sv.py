@@ -21,8 +21,9 @@ rt_bc_api = pytest.importorskip("zuspec.be.bc.share.rt_bc_api")
 
 C_PKG = Path(sv_dir()) / "zsp_rt_bc_pkg.sv"
 PY_PKG = rt_bc_api.sv_dir() / "zsp_rt_bc_pkg.sv"
-#: what a variant adds to the list: its loader and its name for messages
-EXTRA = {"load", "impl"}
+#: what a variant adds to the list: its loader, its name for messages and
+#: the static image_root (an engine's name before its load)
+EXTRA = {"load", "impl", "image_root"}
 
 
 def _methods(path: Path) -> dict:
